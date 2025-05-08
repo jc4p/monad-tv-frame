@@ -1,0 +1,12 @@
+name = "fc-monad-testnet-api"
+main = "src/index.js"
+compatibility_date = "2025-05-08"
+
+# Bindings
+# Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+# databases, object storage, AI inference, real-time communication and more.
+# https://developers.cloudflare.com/workers/runtime-apis/bindings/
+
+kv_namespaces = [
+  { binding = "LOG_CACHE", id = "02b1d3a562a544bcbbcc1edcb68cbf6b", preview_id = "05659494dbcc46cd914a40f90cb76d0a" }
+]

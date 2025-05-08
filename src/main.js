@@ -4,7 +4,12 @@ import * as frame from '@farcaster/frame-sdk';
 import { createWalletClient, createPublicClient, custom, http, encodeFunctionData, bytesToHex, parseAbiItem, hexToBytes, formatUnits } from 'viem';
 
 const MONAD_TESTNET_CHAIN_ID = 10143;
-const MONAD_TESTNET_RPC_URL = 'https://testnet-rpc.monad.xyz';
+// Use the Alchemy RPC URL from Vite environment variables
+const MONAD_TESTNET_RPC_URL = import.meta.env.VITE_ALCHEMY_MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz'; // Fallback if not set
+if (!import.meta.env.VITE_ALCHEMY_MONAD_RPC_URL) {
+    console.warn("VITE_ALCHEMY_MONAD_RPC_URL not found in .env, using default Monad public RPC. Log queries might be limited.");
+}
+
 const MONAD_TESTNET = {
   id: MONAD_TESTNET_CHAIN_ID,
   name: 'Monad Testnet',
@@ -27,8 +32,8 @@ function getPublicClient() {
 }
 // --- End Helper function ---
 
-// --- Smart Contract Configuration (NEEDS ACTUAL VALUES) ---
-const FRAME_RECORDER_CONTRACT_ADDRESS = '0x1B5481D98B0cD6b3422E15d6e16102C3780B08Ec'; // Updated contract address
+// --- Smart Contract Configuration ---
+const FRAME_RECORDER_CONTRACT_ADDRESS = '0x1B5481D98B0cD6b3422E15d6e16102C3780B08Ec'; // Restored contract address
 const frameRecorderAbi = [
   parseAbiItem('function setFrames(bytes calldata _firstFrame, bytes calldata _compressedDiffs, uint32[] calldata _diffLengths, uint256 fid) external'),
   parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'),
@@ -36,7 +41,7 @@ const frameRecorderAbi = [
   parseAbiItem('function getFrameCount(address user) external view returns (uint256)'),
   parseAbiItem('function getClipMetadata(address user) external view returns (uint256 fid, uint256 timestamp)'),
   parseAbiItem('function getParticipants() external view returns (address[] memory)')
-];
+]; // Restored ABI definition
 // --- End Smart Contract Configuration ---
 
 // DOM Element References
@@ -66,6 +71,13 @@ let recordingInterval = null;
 let playbackInterval = null;
 let recordedFrames = [];
 let lastFrameImageData = null;
+
+// Fallback if not set, and log a warning.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787'; 
+if (!import.meta.env.VITE_API_BASE_URL) {
+    console.warn(`VITE_API_BASE_URL not found in .env, using default ${API_BASE_URL}. Ensure your API worker is running there or configure the .env var.`);
+}
+const RECENT_LOGS_API_ENDPOINT = `${API_BASE_URL}/recent`;
 
 // --- Live Preview Functions ---
 function startLivePreview() {
@@ -860,14 +872,13 @@ function debounce(func, wait) {
     };
 }
 
-async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parameter
-    const client = getPublicClient();
-    stopMainAnimationLoop(); // Stop any existing loop first
-    activeGridPlayers = []; // Clear previous players
-    videoGridContainer.innerHTML = ''; // Clear the grid container
+async function loadAndDisplayGridVideos(totalCells) { 
+    stopMainAnimationLoop(); 
+    activeGridPlayers = []; 
+    videoGridContainer.innerHTML = ''; 
 
-    // 1. Initialize grid with noise players
-    for (let i = 0; i < totalCells; i++) { // Use totalCells parameter
+    // Initialize grid with noise players first
+    for (let i = 0; i < totalCells; i++) { 
         const canvas = document.createElement('canvas');
         canvas.className = 'grid-video-canvas';
         videoGridContainer.appendChild(canvas);
@@ -884,56 +895,145 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
     }
     
     const loadingMessage = document.createElement('p');
-    loadingMessage.textContent = 'Loading videos from Monad (new structure)...';
+    loadingMessage.textContent = 'Loading videos (API & Recent)...';
     loadingMessage.style.cssText = 'color: white; grid-column: 1 / -1; text-align: center;';
     videoGridContainer.insertAdjacentElement('afterbegin', loadingMessage);
 
-    try {
-        console.log(`Grid: Attempting to get logs for contract ${FRAME_RECORDER_CONTRACT_ADDRESS}...`);
-        const videoClipUpdatedLogs = await client.getLogs({
-            address: FRAME_RECORDER_CONTRACT_ADDRESS,
-            event: parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'),
-            fromBlock: 'earliest', 
-            toBlock: 'latest'
-        });
+    let combinedLogs = [];
+    const processedLogSignatures = new Set(); // To avoid duplicates if events overlap slightly
 
-        console.log('Grid: videoClipUpdatedLogs raw result:', JSON.stringify(videoClipUpdatedLogs, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
+    try {
+        // --- Phase 1: Fetch historical logs from API/Worker --- 
+        console.log(`Grid: Phase 1 - Attempting to get logs from API endpoint: ${RECENT_LOGS_API_ENDPOINT}`);
+        try {
+            const response = await fetch(RECENT_LOGS_API_ENDPOINT);
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`API request failed with status ${response.status}: ${errorText}`);
+            }
+            const apiResult = await response.json();
+            const apiLogs = apiResult.logs || [];
+            console.log(`Grid: Phase 1 - Received ${apiLogs.length} logs from API. Last processed block by API: ${apiResult.lastProcessedBlock}`);
+            
+            apiLogs.forEach(log => {
+                // Create a unique signature for each log to help with deduplication
+                const logSignature = `${log.transactionHash}-${log.logIndex}`;
+                if (!processedLogSignatures.has(logSignature)) {
+                    combinedLogs.push(log);
+                    processedLogSignatures.add(logSignature);
+                }
+            });
+        } catch (apiError) {
+            console.error("Grid: Phase 1 - Error fetching or processing API logs:", apiError);
+            // Continue to Phase 2 even if API fails, to get recent logs at least
+        }
+
+        // --- Phase 2: Fetch recent logs directly using Viem and public Monad RPC --- 
+        console.log("Grid: Phase 2 - Attempting to get recent logs directly from public Monad RPC...");
+        try {
+            const directPublicClient = createPublicClient({ // Use the original getPublicClient helper if it points to public Monad RPC
+                chain: MONAD_TESTNET, // Ensure MONAD_TESTNET uses the public RPC URL if different from Alchemy
+                transport: http(import.meta.env.VITE_MONAD_PUBLIC_RPC_URL || 'https://testnet-rpc.monad.xyz') // Explicit public RPC
+            });
+            if (!directPublicClient.transport.url) {
+                 console.warn("Grid: Phase 2 - Public Monad RPC URL for direct fetching is not configured. Add VITE_MONAD_PUBLIC_RPC_URL to .env or rely on fallback.");
+            }
+            console.log(`Grid: Phase 2 - Using direct RPC: ${directPublicClient.transport.url}`);
+
+            const latestBlockDirect = await directPublicClient.getBlockNumber();
+            console.log(`Grid: Phase 2 - Latest block (direct RPC): ${latestBlockDirect}`);
+
+            const DIRECT_BLOCK_RANGE_LIMIT = 100;
+            const DIRECT_TOTAL_BLOCKS_TO_QUERY = 200;
+            
+            let queryFromBlockDirect = BigInt(Math.max(0, Number(latestBlockDirect) - (DIRECT_TOTAL_BLOCKS_TO_QUERY -1)));
+            if (queryFromBlockDirect < 0n) queryFromBlockDirect = 0n;
+
+            console.log(`Grid: Phase 2 - Starting direct log query from block ${queryFromBlockDirect} up to ${latestBlockDirect}.`);
+
+            for (let i = 0; i < Math.ceil(DIRECT_TOTAL_BLOCKS_TO_QUERY / DIRECT_BLOCK_RANGE_LIMIT); i++) {
+                const chunkFromBlock = queryFromBlockDirect + BigInt(i * DIRECT_BLOCK_RANGE_LIMIT);
+                let chunkToBlock = chunkFromBlock + BigInt(DIRECT_BLOCK_RANGE_LIMIT - 1);
+
+                if (chunkFromBlock > latestBlockDirect) break;
+                if (chunkToBlock > latestBlockDirect) chunkToBlock = latestBlockDirect;
+
+                // console.log(`Grid: Phase 2 - Fetching direct logs for chunk: ${chunkFromBlock} to ${chunkToBlock}`); // Reduced verbosity
+                const directChunkLogs = await directPublicClient.getLogs({
+                    address: FRAME_RECORDER_CONTRACT_ADDRESS,
+                    event: parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'),
+                    fromBlock: chunkFromBlock,
+                    toBlock: chunkToBlock
+                });
+
+                if (directChunkLogs && directChunkLogs.length > 0) {
+                    console.log(`Grid: Phase 2 - Found ${directChunkLogs.length} direct logs in chunk ${chunkFromBlock}-${chunkToBlock}.`);
+                    directChunkLogs.forEach(log => {
+                        const logSignature = `${log.transactionHash}-${log.logIndex}`;
+                        if (!processedLogSignatures.has(logSignature)) {
+                            combinedLogs.push(JSON.parse(JSON.stringify(log, (k,v) => typeof v === 'bigint' ? v.toString() : v))); // Ensure BigInts are strings for consistency
+                            processedLogSignatures.add(logSignature);
+                        }
+                    });
+                }
+                 if (chunkToBlock === latestBlockDirect) break;
+            }
+        } catch (directRpcError) {
+            console.error("Grid: Phase 2 - Error fetching or processing direct RPC logs:", directRpcError);
+        }
+        
+        // --- Phase 3: Process Combined Logs --- 
+        console.log(`Grid: Phase 3 - Total combined logs (after deduplication): ${combinedLogs.length}`);
+        // console.log('Grid: Combined logs raw result:', JSON.stringify(combinedLogs, null, 2)); // Removed verbose log
 
         if (videoGridContainer.contains(loadingMessage)) {
             videoGridContainer.removeChild(loadingMessage);
         }
 
-        if (!videoClipUpdatedLogs || videoClipUpdatedLogs.length === 0) {
-            console.log('Grid: No VideoClipUpdated logs found on contract. Displaying noise only.');
+        if (!combinedLogs || combinedLogs.length === 0) {
+            console.log('Grid: No VideoClipUpdated logs found from any source. Displaying noise only.');
         } else {
-            videoClipUpdatedLogs.sort((a, b) => Number(b.args.timestamp) - Number(a.args.timestamp));
+            combinedLogs.sort((a, b) => Number(b.args.timestamp) - Number(a.args.timestamp)); // Sort newest first
+            
             const latestUpdates = new Map();
-            videoClipUpdatedLogs.forEach(log => {
-                if (log.args && log.args.user) { // Ensure args and user exist
+            combinedLogs.forEach(log => {
+                if (log.args && log.args.user) { 
+                    // Since we sort by timestamp DESC, the first one we see for a user is the latest.
                     if (!latestUpdates.has(log.args.user)) {
-                        latestUpdates.set(log.args.user, { fid: log.args.fid, timestamp: log.args.timestamp });
+                        latestUpdates.set(log.args.user, { 
+                            fid: BigInt(log.args.fid), 
+                            timestamp: BigInt(log.args.timestamp)
+                        });
                     }
                 } else {
-                    console.warn('Grid: Log entry missing args or args.user:', log);
+                    console.warn('Grid: Combined log entry missing args or args.user:', log);
                 }
             });
-            console.log('Grid: latestUpdates map:', latestUpdates);
+            // console.log('Grid: latestUpdates map (from combined, sorted logs):', latestUpdates); // Removed verbose log
 
             let contractVideosLoaded = 0;
-            for (const [userAddress, { fid, timestamp }] of latestUpdates.entries()) {
-                console.log(`Grid: Processing latest update for user: ${userAddress}, FID: ${fid}, Timestamp: ${timestamp}`);
+            const publicClientForClips = getPublicClient(); // This should use Alchemy for getFullClipData if preferred
+
+            // Create an array from the map to control insertion order into activeGridPlayers
+            const sortedUniqueUsers = Array.from(latestUpdates.entries());
+            // The map already has the latest by user due to insertion logic after sorting combinedLogs.
+            // If further specific sorting of users is needed (e.g. by their latest timestamp), it can be done here.
+            // For now, map iteration order is fine as combinedLogs was pre-sorted.
+
+            for (const [userAddress, { fid, timestamp }] of sortedUniqueUsers) {
+                // console.log(`Grid: Processing final entry for user: ${userAddress}, FID: ${fid}, Timestamp: ${timestamp}`); // Reduced verbosity
                 if (contractVideosLoaded >= totalCells) break;
 
                 try {
-                    console.log(`Grid: Calling getFullClipData for user ${userAddress}`);
-                    const clipData = await client.readContract({
+                    // console.log(`Grid: Calling getFullClipData for user ${userAddress} (using client: ${publicClientForClips.transport.url})`);
+                    const clipData = await publicClientForClips.readContract({
                         address: FRAME_RECORDER_CONTRACT_ADDRESS, 
                         abi: frameRecorderAbi,
                         functionName: 'getFullClipData', 
                         args: [userAddress]
                     });
                     
-                    console.log(`Grid: Raw clipData for ${userAddress}:`, JSON.stringify(clipData, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
+                    // console.log(`Grid: Raw clipData for ${userAddress}:`, JSON.stringify(clipData, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2)); // Removed verbose log
 
                     const structuredClipData = {
                         firstFrame: clipData[0],
@@ -942,28 +1042,32 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
                         fid: clipData[3],
                         timestamp: clipData[4]
                     };
-                    console.log(`Grid: Structured clipData for ${userAddress}:`, structuredClipData);
+                    // console.log(`Grid: Structured clipData for ${userAddress}:`, structuredClipData); // Removed verbose log
 
                     if (!structuredClipData.firstFrame || structuredClipData.firstFrame === '0x' || hexToBytes(structuredClipData.firstFrame).length === 0) {
                         console.warn(`Grid: No valid firstFrame data for user ${userAddress}, FID ${fid}. Skipping.`);
                         continue;
                     }
 
-                    if (contractVideosLoaded < activeGridPlayers.length) {
+                    // Replace a noise player. Since sortedUniqueUsers is newest first, this inserts at start of available slots.
+                    if (contractVideosLoaded < activeGridPlayers.length && activeGridPlayers[contractVideosLoaded] instanceof NoisePlayerData) {
                         const targetCanvas = activeGridPlayers[contractVideosLoaded].canvas;
                         activeGridPlayers[contractVideosLoaded] = new GridPlayerData(targetCanvas, structuredClipData, userAddress, fid, timestamp);
                         activeGridPlayers[contractVideosLoaded].prepareForPlayback(); 
-                        console.log(`Grid: Successfully processed and added video for ${userAddress} to activeGridPlayers.`);
+                        // console.log(`Grid: Successfully placed video for ${userAddress} at grid index ${contractVideosLoaded}.`); // Reduced verbosity
+                    } else if (contractVideosLoaded >= activeGridPlayers.length) {
+                        // This case should ideally not be hit if totalCells matches noise player init
+                        console.warn("Grid: Attempted to load more videos than available noise player slots.");
                     }
                     contractVideosLoaded++;
                 } catch (userError) {
                     console.error(`Grid: Error loading full clip data for user ${userAddress} (FID: ${fid}):`, userError);
                 }
             }
-            console.log(`Grid: Loaded ${contractVideosLoaded} contract videos (new structure) into the grid.`);
+            console.log(`Grid: Loaded ${contractVideosLoaded} contract videos (combined sources) into the grid.`);
         }
     } catch (error) {
-        console.error('Grid: Error loading video logs or processing videos (new structure):', error);
+        console.error('Grid: Outer error in loadAndDisplayGridVideos:', error);
         if (videoGridContainer.contains(loadingMessage)) {
             videoGridContainer.removeChild(loadingMessage);
         }
