@@ -263,49 +263,106 @@ function closeRecordModal() {
 
 // Event Listeners for Modal
 openRecordModalButton.addEventListener('click', () => {
-  // 1) Show modal and set initial status text immediately
-  recordModal.style.display = 'flex';
-  modalStatusElement.textContent = 'Requesting webcam access…';
+  console.log('Open Record Modal button clicked. Attempting to get user media...');
+  // Set a very basic status immediately.
+  // Avoid heavy DOM manipulation (like showing the full modal) BEFORE getUserMedia resolves.
+  modalStatusElement.textContent = 'Requesting camera permission...';
 
-  // 2) Immediately invoke getUserMedia (no async/await before it)
-  navigator.mediaDevices.getUserMedia({
-    video: true,
-    audio: false
-  })
-  .then(stream => {
-    // Perform other modal state resets and UI setup *after* stream is acquired
-    if (playbackInterval) {
+  navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+    .then(stream => {
+      console.log('Camera stream acquired successfully!');
+      modalStatusElement.textContent = 'Camera access granted. Initializing preview...';
+
+      // --- NOW do all the UI setup that depends on having the stream ---
+      recordModal.style.display = 'flex'; // Show the modal
+
+      if (playbackInterval) {
         clearInterval(playbackInterval);
         playbackInterval = null;
-    }
-    recordedFrames = [];
-    lastFrameImageData = null;
-    reconstructedModalPlaybackFrame = null;
+      }
+      recordedFrames = [];
+      lastFrameImageData = null;
+      reconstructedModalPlaybackFrame = null;
 
-    modalPlayButton.style.display = 'none';
-    modalSaveButton.style.display = 'none';
-    modalRecordButton.textContent = 'Start Recording';
-    modalRecordButton.disabled = true; // Disable initially, will be enabled on success
-    
-    // Process the stream
-    videoElement.srcObject = stream;
-    modalStatusElement.textContent = 'Initializing webcam preview…'; // Matched user's example
-    console.log(`Webcam stream acquired. Video dimensions: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
-  })
-  .then(() => {
-    startLivePreview();
-    modalStatusElement.textContent = 'Ready to record.';
-    modalRecordButton.disabled = false; // Enable record button now that preview is ready
-  })
-  .catch(err => {
-    console.error('Webcam access or initialization failed:', err);
-    // Use a more user-friendly error message format as suggested
-    modalStatusElement.textContent = `Error accessing camera ${err.name || ''}: ${err.message || 'Unknown error'}`;
-    modalRecordButton.disabled = true;
-    stopLivePreview(); // Ensure cleanup
-    // Optionally, hide or offer to close the modal on error
-    // recordModal.style.display = 'none'; 
-  });
+      modalPlayButton.style.display = 'none';
+      modalSaveButton.style.display = 'none';
+      modalRecordButton.textContent = 'Start Recording';
+      modalRecordButton.disabled = true; // Will be enabled after preview setup
+
+      videoElement.srcObject = stream;
+
+      // It's crucial that the video element is already in the DOM and visible
+      // if iOS has any visibility heuristics (you've made it visible, which is good).
+      // The `autoplay` attribute should ideally handle playback.
+
+      videoElement.onloadedmetadata = () => {
+        console.log(`Webcam metadata loaded: ${videoElement.videoWidth}x${videoElement.videoHeight}.`);
+        // `autoplay` should have started it, but if not, play explicitly.
+        if (videoElement.paused) {
+          videoElement.play().then(() => {
+            console.log("Video element play() successful after metadata.");
+            startLivePreview();
+            modalStatusElement.textContent = 'Ready to record.';
+            modalRecordButton.disabled = false;
+          }).catch(e => {
+            console.error("Error attempting to play video after metadata:", e);
+            modalStatusElement.textContent = 'Error playing video: ' + (e.message || 'Unknown error');
+            stopLivePreview();
+            if (videoElement.srcObject) { // Attempt to stop tracks if play failed
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+                videoElement.srcObject = null;
+            }
+          });
+        } else {
+          console.log("Video already playing (likely due to autoplay).");
+          startLivePreview();
+          modalStatusElement.textContent = 'Ready to record.';
+          modalRecordButton.disabled = false;
+        }
+      };
+
+      videoElement.onended = () => {
+        console.log('Webcam stream ended.');
+        stopLivePreview();
+      };
+
+      videoElement.onerror = (e) => { // This catches errors on the video element itself
+        console.error('Video element error:', e);
+        modalStatusElement.textContent = 'Video element error. Cannot display preview.';
+        stopLivePreview();
+        if (videoElement.srcObject) {
+            videoElement.srcObject.getTracks().forEach(track => track.stop());
+            videoElement.srcObject = null;
+        }
+      };
+
+      // If metadata is already loaded (less common for a fresh stream but for robustness)
+      if (videoElement.readyState >= videoElement.HAVE_METADATA) {
+        console.log("Video metadata was already available.");
+        if (videoElement.onloadedmetadata) videoElement.onloadedmetadata();
+      }
+      // --- End of UI setup dependent on stream ---
+    })
+    .catch(err => {
+      console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+      console.error('getUserMedia FAILED. Error Name:', err.name);
+      console.error('getUserMedia FAILED. Error Message:', err.message);
+      console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+      modalStatusElement.textContent = `Camera Error: ${err.name} - ${err.message}. Please check site permissions for this app in your browser/OS settings.`;
+
+      // Show modal to display the error, but ensure webcam-dependent UI is disabled/hidden
+      recordModal.style.display = 'flex';
+      modalRecordButton.disabled = true;
+      modalPlayButton.style.display = 'none';
+      modalSaveButton.style.display = 'none';
+      modalPreviewCanvas.getContext('2d').clearRect(0,0,modalPreviewCanvas.width, modalPreviewCanvas.height); // Clear canvas
+      
+      // Ensure any previously acquired stream (if any, unlikely here) is stopped
+      if (videoElement.srcObject) {
+        videoElement.srcObject.getTracks().forEach(track => track.stop());
+        videoElement.srcObject = null;
+      }
+    });
 });
 
 closeRecordModalButton.addEventListener('click', closeRecordModal);
