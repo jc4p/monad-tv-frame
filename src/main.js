@@ -28,15 +28,14 @@ function getPublicClient() {
 // --- End Helper function ---
 
 // --- Smart Contract Configuration (NEEDS ACTUAL VALUES) ---
-const FRAME_RECORDER_CONTRACT_ADDRESS = '0xe82348597C99447122bEEE5006550351529a5737'; // Updated contract address
+const FRAME_RECORDER_CONTRACT_ADDRESS = '0x1B5481D98B0cD6b3422E15d6e16102C3780B08Ec'; // Updated contract address
 const frameRecorderAbi = [
-  parseAbiItem('function setFrames(bytes[] calldata newFrames, uint256 fid) external'),
-  parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'), // Updated event name
-  parseAbiItem('function getFrames(address user) external view returns (bytes[] memory)'), // Not strictly needed for grid if getFrame used
+  parseAbiItem('function setFrames(bytes calldata _firstFrame, bytes calldata _compressedDiffs, uint32[] calldata _diffLengths, uint256 fid) external'),
+  parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'),
+  parseAbiItem('function getFullClipData(address user) external view returns (bytes memory firstFrame, bytes memory compressedDiffs, uint32[] memory diffLengths, uint256 fid, uint256 timestamp)'),
   parseAbiItem('function getFrameCount(address user) external view returns (uint256)'),
-  parseAbiItem('function getFrame(address user, uint256 frameIndex) external view returns (bytes memory)'),
   parseAbiItem('function getClipMetadata(address user) external view returns (uint256 fid, uint256 timestamp)'),
-  parseAbiItem('function getParticipants() external view returns (address[] memory)') // For potential future use
+  parseAbiItem('function getParticipants() external view returns (address[] memory)')
 ];
 // --- End Smart Contract Configuration ---
 
@@ -117,18 +116,49 @@ let masterLoopId = null;
 let currentUserFid = null; // Store current user's FID
 
 class GridPlayerData {
-    constructor(canvas, framesData, senderAddress, fid, timestamp) {
+    constructor(canvas, contractData, senderAddress, fid, timestamp) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
-        this.frames = framesData;
         this.sender = senderAddress;
         this.fid = fid;
         this.timestamp = timestamp;
+
+        // Data from new contract structure
+        this.firstFrameCompressed = contractData.firstFrame; // hex string from contract
+        this.allDiffsCompressedBlob = contractData.compressedDiffs; // hex string from contract
+        this.diffLengths = contractData.diffLengths; // array of numbers (uint32)
+
+        this.totalFrames = 1 + (this.diffLengths ? this.diffLengths.length : 0);
         this.currentFrameIndex = 0;
-        this.reconstructedFrameData = null;
+        
+        // Playback state
+        this.reconstructedIBaseFrameData = null; // Stores the pixel data of the I-frame once decompressed
+        this.decompressedDiffsBlob = null; // Stores the Uint8Array of all concatenated diffs, decompressed once
+        this.currentPFramePixelData = null; // Stores pixel data for the current P-frame being built or shown
+
         this.lastFrameRenderTime = 0;
         this.frameIntervalMs = 1000 / FPS_GRID;
-        this.canvas.title = `FID: ${fid} (${senderAddress.substring(0,6)}...) at ${new Date(Number(timestamp) * 1000).toLocaleTimeString()}`;
+        this.canvas.title = `FID: ${fid} (${senderAddress.substring(0,6)}...) at ${new Date(Number(timestamp) * 1000).toLocaleTimeString()} (${this.totalFrames} frames)`;
+    }
+
+    // Method to decompress necessary blobs on demand (e.g., before first play)
+    prepareForPlayback() {
+        if (this.firstFrameCompressed && !this.reconstructedIBaseFrameData) {
+            try {
+                this.reconstructedIBaseFrameData = new Uint8Array(pako.inflate(hexToBytes(this.firstFrameCompressed)));
+            } catch (e) {
+                console.error(`GridPlayer ${this.sender}: Error decompressing I-frame`, e);
+                this.reconstructedIBaseFrameData = null; // Mark as failed
+            }
+        }
+        if (this.allDiffsCompressedBlob && !this.decompressedDiffsBlob && this.diffLengths && this.diffLengths.length > 0) {
+            try {
+                this.decompressedDiffsBlob = new Uint8Array(pako.inflate(hexToBytes(this.allDiffsCompressedBlob)));
+            } catch (e) {
+                console.error(`GridPlayer ${this.sender}: Error decompressing P-frames blob`, e);
+                this.decompressedDiffsBlob = null; // Mark as failed
+            }
+        }
     }
 }
 
@@ -399,32 +429,24 @@ modalRecordButton.addEventListener('click', async () => {
     modalPreviewCtx.putImageData(imageData, 0, 0);
 
     let currentFrameStorage;
-    let compressedData;
-    let originalPayloadSize;
 
-    if (!lastFrameImageData) {
+    if (!lastFrameImageData) { // This is the first frame (I-frame)
       const fullFrameGrayscalePixels = new Uint8Array(TOTAL_PIXELS);
       for (let i = 0, j = 0; i < imageData.data.length; i += 4, j++) {
         fullFrameGrayscalePixels[j] = imageData.data[i];
       }
-      originalPayloadSize = fullFrameGrayscalePixels.byteLength;
-      compressedData = pako.deflate(fullFrameGrayscalePixels);
+      const compressedData = pako.deflate(fullFrameGrayscalePixels);
       currentFrameStorage = {
         type: 'full',
         compressedData: compressedData,
-        size: compressedData.byteLength,
-        originalSize: originalPayloadSize
       };
-    } else {
+    } else { // This is a subsequent frame (P-frame/diff)
       const diffResult = diffFrames(imageData, lastFrameImageData);
       const serializedDiffData = serializeDiff(diffResult.diff);
-      originalPayloadSize = serializedDiffData.byteLength;
-      compressedData = pako.deflate(serializedDiffData);
       currentFrameStorage = {
-        type: 'diff',
-        compressedData: compressedData,
-        size: compressedData.byteLength,
-        originalSize: originalPayloadSize
+        type: 'raw_diff',
+        serializedData: serializedDiffData,
+        originalLength: serializedDiffData.byteLength
       };
     }
     recordedFrames.push(currentFrameStorage);
@@ -503,11 +525,20 @@ function stopRecording() {
     modalRecordButton.disabled = false;         
     modalPlayButton.style.display = 'none'; 
     
-    // Calculate total compressed size
-    const totalCompressedSizeBytes = recordedFrames.reduce((sum, frame) => sum + (frame.compressedData?.byteLength || 0), 0);
-    const totalCompressedSizeKB = (totalCompressedSizeBytes / 1024).toFixed(2);
+    // Calculate total *uncompressed* size for display (approximate, as first frame is compressed)
+    let estimatedTotalUncompressedSizeBytes = 0;
+    if (recordedFrames[0] && recordedFrames[0].type === 'full') {
+        // Estimate original size of full frame (TOTAL_PIXELS for grayscale)
+        estimatedTotalUncompressedSizeBytes += TOTAL_PIXELS; 
+    }
+    recordedFrames.slice(1).forEach(frame => {
+        if (frame.type === 'raw_diff') {
+            estimatedTotalUncompressedSizeBytes += frame.originalLength;
+        }
+    });
+    const estimatedTotalUncompressedSizeKB = (estimatedTotalUncompressedSizeBytes / 1024).toFixed(2);
     
-    modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview... (${totalCompressedSizeKB} KB)`;
+    modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview... (Raw size ~${estimatedTotalUncompressedSizeKB} KB)`;
     
     stopLivePreview(); 
 
@@ -525,16 +556,18 @@ function stopRecording() {
   }
   
   // Log summary including total size
-  const totalCompressedSizeBytes = recordedFrames.reduce((sum, frame) => sum + (frame.compressedData?.byteLength || 0), 0);
-  const totalCompressedSizeKB = (totalCompressedSizeBytes / 1024).toFixed(2);
   const recordingTimestamp = new Date().toISOString();
   console.log('--- Modal Recording Summary ---');
   if(currentUserFid) console.log(`FID (from Frame SDK): ${currentUserFid}`);
   console.log(`Timestamp: ${recordingTimestamp}`);
   console.log(`Total Frames: ${recordedFrames.length}`);
-  console.log(`Total Compressed Size: ${totalCompressedSizeBytes} bytes (${totalCompressedSizeKB} KB)`); // Log size in bytes and KB
-  if (recordedFrames.length > 0 && recordedFrames[0] && recordedFrames[0].compressedData) {
+  if (recordedFrames.length > 0 && recordedFrames[0] && recordedFrames[0].type === 'full' && recordedFrames[0].compressedData) {
     console.log(`Size of first frame (compressed): ${recordedFrames[0].compressedData.byteLength} bytes (${(recordedFrames[0].compressedData.byteLength / 1024).toFixed(2)} KB)`);
+    let totalRawDiffSize = 0;
+    recordedFrames.slice(1).forEach(frame => {
+        if (frame.type === 'raw_diff') totalRawDiffSize += frame.originalLength;
+    });
+    console.log(`Total size of raw serialized diffs: ${totalRawDiffSize} bytes (${(totalRawDiffSize / 1024).toFixed(2)} KB)`);
   }
 }
 
@@ -545,11 +578,11 @@ function stopRecording() {
 let reconstructedModalPlaybackFrame = null; // Specific for modal playback
 
 function reconstructAndDrawFrame(context, storedFrameData, isStaticPreview = false) {
-  let decompressedData;
+  let decompressedData; // For full frames
   let currentFramePixelArray; // This will be the Uint8Array of grayscale pixels for the target frame
 
-  if (!storedFrameData || !storedFrameData.type || !storedFrameData.compressedData) {
-      console.error("reconstructAndDrawFrame: Invalid storedFrameData provided.", storedFrameData);
+  if (!storedFrameData || !storedFrameData.type) {
+      console.error("reconstructAndDrawFrame: Invalid storedFrameData (no type)", storedFrameData);
       context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
       context.fillStyle = 'red';
       context.fillText('Invalid frame data', 10, 10);
@@ -558,31 +591,41 @@ function reconstructAndDrawFrame(context, storedFrameData, isStaticPreview = fal
 
   try {
     if (storedFrameData.type === 'full') {
+      if (!storedFrameData.compressedData) {
+        console.error("reconstructAndDrawFrame: Full frame missing compressedData", storedFrameData);
+        context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
+        context.fillText('Error full frame data', 10, 10); return;
+      }
       decompressedData = pako.inflate(storedFrameData.compressedData);
       currentFramePixelArray = new Uint8Array(decompressedData);
       if (!isStaticPreview) {
-        reconstructedModalPlaybackFrame = currentFramePixelArray; // Update playback base
+        reconstructedModalPlaybackFrame = currentFramePixelArray; // Update playback base for dynamic playback
       }
-    } else { // DIFF frame
-      decompressedData = pako.inflate(storedFrameData.compressedData);
-      const diffArray = deserializeDiff(new Uint8Array(decompressedData));
+    } else if (storedFrameData.type === 'raw_diff') { // Handle new raw_diff type for local playback
+      if (!storedFrameData.serializedData) {
+        console.error("reconstructAndDrawFrame: Raw_diff frame missing serializedData", storedFrameData);
+        context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
+        context.fillText('Error diff data', 10, 10); return;
+      }
+      const diffArray = deserializeDiff(storedFrameData.serializedData); // Directly deserialize
       let baseFrameForDiffLogic;
 
       if (isStaticPreview) {
-        // For static preview of a diff, we need to reconstruct from recordedFrames up to this point
+        // For static preview of a raw_diff, reconstruct from recordedFrames up to this point
         let tempReconstructed = null;
         let foundTarget = false;
         for (const frame of recordedFrames) {
           if (frame.type === 'full') {
+            if (!frame.compressedData) { console.error("Static preview: Full frame in sequence missing data"); return; }
             tempReconstructed = new Uint8Array(pako.inflate(frame.compressedData));
-          } else { // diff
+          } else if (frame.type === 'raw_diff') { // It's a raw_diff in the sequence
             if (!tempReconstructed) {
-              console.error("Static reconstruct: Diff found before full frame in recorded sequence for preview.");
+              console.error("Static reconstruct: Raw_diff found before full frame in recorded sequence for preview.");
               context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
               context.fillText('Error static diff preview', 10, 10); return;
             }
-            const inflatedDiff = pako.inflate(frame.compressedData);
-            const diffsToApply = deserializeDiff(new Uint8Array(inflatedDiff));
+            if (!frame.serializedData) { console.error("Static preview: Raw_diff in sequence missing data"); return; }
+            const diffsToApply = deserializeDiff(frame.serializedData);
             let newPixelData = new Uint8Array(tempReconstructed); // Operate on a copy
             for (const d of diffsToApply) {
               if (d.index < newPixelData.length) newPixelData[d.index] = d.value;
@@ -597,23 +640,20 @@ function reconstructAndDrawFrame(context, storedFrameData, isStaticPreview = fal
           }
         }
         if (!foundTarget) {
-            console.error("Static reconstruct: Target diff frame not found in sequence for reconstruction.", storedFrameData);
+            console.error("Static reconstruct: Target raw_diff frame not found in sequence.", storedFrameData);
             context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
             context.fillText('Error finding static diff', 10, 10); return;
         }
-      } else { // Dynamic Playback
+      } else { // Dynamic Playback of raw_diff
         if (!reconstructedModalPlaybackFrame) {
           const firstFullFrame = recordedFrames.find(f => f.type === 'full');
-          if (firstFullFrame) {
+          if (firstFullFrame && firstFullFrame.compressedData) {
               reconstructedModalPlaybackFrame = new Uint8Array(pako.inflate(firstFullFrame.compressedData));
-              // If storedFrameData *is* the firstFullFrame, currentFramePixelArray is this.
-              if (firstFullFrame.type === storedFrameData.type && firstFullFrame.compressedData.byteLength === storedFrameData.compressedData.byteLength && firstFullFrame.compressedData.every((val, idx) => val === storedFrameData.compressedData[idx])) {
-                   currentFramePixelArray = reconstructedModalPlaybackFrame;
-              } else {
-                   baseFrameForDiffLogic = reconstructedModalPlaybackFrame; // Base established, current diff still needs to be applied
-              }
+              // If storedFrameData *is* the firstFullFrame (it shouldn't be if type is raw_diff, but defensive check)
+              // This path primarily expects storedFrameData to be a raw_diff, so a base must exist or be created.
+              baseFrameForDiffLogic = reconstructedModalPlaybackFrame;
           } else {
-            console.error('Playback: Cannot reconstruct diff. No base (first full) frame available in recording.');
+            console.error('Playback: Cannot reconstruct raw_diff. No base (first full) frame available.');
             context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
             context.fillText('Error playback: no full frame', 10, 10); return;
           }
@@ -621,19 +661,39 @@ function reconstructAndDrawFrame(context, storedFrameData, isStaticPreview = fal
            baseFrameForDiffLogic = reconstructedModalPlaybackFrame;
         }
         
-        if (!currentFramePixelArray) { // If not set by being the firstFullFrame itself
-          if (!baseFrameForDiffLogic) {
-              console.error('Playback: baseFrameForDiffLogic is unexpectedly null for diff frame.');
-              context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
-              context.fillText('Error base for diff', 10, 10); return;
-          }
-          currentFramePixelArray = new Uint8Array(baseFrameForDiffLogic); // Start from the base (copy)
-          for (const diff of diffArray) { // diffArray is from the current storedFrameData
-            if (diff.index < currentFramePixelArray.length) currentFramePixelArray[diff.index] = diff.value;
-          }
+        if (!baseFrameForDiffLogic) {
+            console.error('Playback: baseFrameForDiffLogic is unexpectedly null for raw_diff frame.');
+            context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
+            context.fillText('Error base for diff', 10, 10); return;
+        }
+        currentFramePixelArray = new Uint8Array(baseFrameForDiffLogic); // Start from the base (copy)
+        for (const diff of diffArray) { // diffArray is from the current storedFrameData (raw_diff)
+          if (diff.index < currentFramePixelArray.length) currentFramePixelArray[diff.index] = diff.value;
         }
         reconstructedModalPlaybackFrame = currentFramePixelArray; // Update global playback state
       }
+    } else { // Old 'diff' type, which should no longer occur for local playback if new recording logic is used.
+            // This block is for backwards compatibility or if old data is somehow loaded.
+            // We can eventually remove this if all recordings are new.
+      console.warn("reconstructAndDrawFrame: Encountered old 'diff' type. Assuming it has compressedData.");
+      if (!storedFrameData.compressedData) {
+        console.error("reconstructAndDrawFrame: Old diff frame missing compressedData", storedFrameData);
+        context.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT); context.fillStyle = 'red';
+        context.fillText('Error old diff data', 10, 10); return;
+      }
+      decompressedData = pako.inflate(storedFrameData.compressedData);
+      const diffArray = deserializeDiff(new Uint8Array(decompressedData));
+      // ... (rest of old diff logic, which is similar to raw_diff dynamic playback but from compressed source) ...
+      // For simplicity, during this refactor, focus on 'full' and 'raw_diff'.
+      // If this old path is hit, it will likely rely on reconstructedModalPlaybackFrame being set correctly by a prior full frame.
+      if (!reconstructedModalPlaybackFrame) {
+          console.error("Old diff playback: no base frame."); return;
+      }
+      currentFramePixelArray = new Uint8Array(reconstructedModalPlaybackFrame);
+      for (const diff of diffArray) { 
+        if (diff.index < currentFramePixelArray.length) currentFramePixelArray[diff.index] = diff.value;
+      }
+      reconstructedModalPlaybackFrame = currentFramePixelArray;
     }
 
     if (!currentFramePixelArray) {
@@ -834,7 +894,7 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
         activeGridPlayers.push(new NoisePlayerData(canvas));
     }
 
-    if (!FRAME_RECORDER_CONTRACT_ADDRESS || FRAME_RECORDER_CONTRACT_ADDRESS === '0xYourUpdatedContractAddressHere') {
+    if (!FRAME_RECORDER_CONTRACT_ADDRESS || FRAME_RECORDER_CONTRACT_ADDRESS.toLowerCase() === '0xyourupdatedcontractaddresshere'.toLowerCase()) {
         console.warn("Grid: Contract address not set. Displaying noise only.");
         videoGridContainer.insertAdjacentHTML('afterbegin', '<p style="color:orange; grid-column: 1 / -1; text-align: center;">Contract address not set. Update main.js.</p>');
         if (activeGridPlayers.length > 0) {
@@ -843,9 +903,8 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
         return;
     }
     
-    // Add a temporary loading message that spans across the grid
     const loadingMessage = document.createElement('p');
-    loadingMessage.textContent = 'Loading videos from Monad...';
+    loadingMessage.textContent = 'Loading videos from Monad (new structure)...';
     loadingMessage.style.cssText = 'color: white; grid-column: 1 / -1; text-align: center;';
     videoGridContainer.insertAdjacentElement('afterbegin', loadingMessage);
 
@@ -857,15 +916,12 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
             toBlock: 'latest'
         });
 
-        // Remove loading message once logs are (or are not) fetched
         if (videoGridContainer.contains(loadingMessage)) {
             videoGridContainer.removeChild(loadingMessage);
         }
 
         if (videoClipUpdatedLogs.length === 0) {
             console.log('No video logs found on contract. Displaying noise only.');
-            // No need to add a message if noise is already showing.
-            // We could add a small, less intrusive message if desired.
         } else {
             videoClipUpdatedLogs.sort((a, b) => Number(b.args.timestamp) - Number(a.args.timestamp));
             const latestUpdates = new Map();
@@ -877,43 +933,50 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
 
             let contractVideosLoaded = 0;
             for (const [userAddress, { fid, timestamp }] of latestUpdates.entries()) {
-                if (contractVideosLoaded >= totalCells) break; // Use totalCells
+                if (contractVideosLoaded >= totalCells) break;
 
                 try {
-                    const frameCount = await client.readContract({
-                        address: FRAME_RECORDER_CONTRACT_ADDRESS, abi: frameRecorderAbi,
-                        functionName: 'getFrameCount', args: [userAddress]
+                    // Fetch data using the new getFullClipData function
+                    const clipData = await client.readContract({
+                        address: FRAME_RECORDER_CONTRACT_ADDRESS, 
+                        abi: frameRecorderAbi,
+                        functionName: 'getFullClipData', 
+                        args: [userAddress]
                     });
+                    
+                    // clipData will be an object/array with firstFrame, compressedDiffs, diffLengths, fid, timestamp
+                    // The contract returns them as positional array: [firstFrame, compressedDiffs, diffLengths, fid, timestamp]
+                    const structuredClipData = {
+                        firstFrame: clipData[0],
+                        compressedDiffs: clipData[1],
+                        diffLengths: clipData[2].map(len => Number(len)), // Ensure diffLengths are numbers
+                        fid: clipData[3],
+                        timestamp: clipData[4]
+                    };
 
-                    if (Number(frameCount) === 0) continue;
-
-                    const userFramesData = [];
-                    for (let j = 0; j < Number(frameCount); j++) {
-                        const frameHex = await client.readContract({
-                            address: FRAME_RECORDER_CONTRACT_ADDRESS, abi: frameRecorderAbi,
-                            functionName: 'getFrame', args: [userAddress, BigInt(j)]
-                        });
-                        userFramesData.push({
-                            type: j === 0 ? 'full' : 'diff',
-                            compressedData: hexToBytes(frameHex)
-                        });
+                    // Basic validation: check if firstFrame exists
+                    if (!structuredClipData.firstFrame || structuredClipData.firstFrame === '0x' || hexToBytes(structuredClipData.firstFrame).length === 0) {
+                        console.warn(`Grid: No valid firstFrame data for user ${userAddress}, FID ${fid}. Skipping.`);
+                        continue;
                     }
 
                     // Replace a noise player with this contract video player
                     if (contractVideosLoaded < activeGridPlayers.length) {
-                        const targetCanvas = activeGridPlayers[contractVideosLoaded].canvas; // Get canvas from existing noise player
-                        activeGridPlayers[contractVideosLoaded] = new GridPlayerData(targetCanvas, userFramesData, userAddress, fid, timestamp);
+                        const targetCanvas = activeGridPlayers[contractVideosLoaded].canvas;
+                        // Pass the structuredClipData to the GridPlayerData constructor
+                        activeGridPlayers[contractVideosLoaded] = new GridPlayerData(targetCanvas, structuredClipData, userAddress, fid, timestamp);
+                        // Prepare data for playback (decompress blobs)
+                        activeGridPlayers[contractVideosLoaded].prepareForPlayback(); 
                     }
                     contractVideosLoaded++;
                 } catch (userError) {
-                    console.error(`Grid: Error loading frames for user ${userAddress}:`, userError);
-                    // If a user's video fails to load, its slot will remain a noise player.
+                    console.error(`Grid: Error loading full clip data for user ${userAddress} (FID: ${fid}):`, userError);
                 }
             }
-            console.log(`Loaded ${contractVideosLoaded} contract videos into the grid.`);
+            console.log(`Loaded ${contractVideosLoaded} contract videos (new structure) into the grid.`);
         }
     } catch (error) {
-        console.error('Grid: Error loading video logs or processing videos:', error);
+        console.error('Grid: Error loading video logs or processing videos (new structure):', error);
         if (videoGridContainer.contains(loadingMessage)) {
             videoGridContainer.removeChild(loadingMessage);
         }
@@ -923,8 +986,7 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
         videoGridContainer.insertAdjacentElement('afterbegin', errorMessage);
     }
 
-    // Always start the animation loop, it will render noise or videos
-    if (activeGridPlayers.length > 0 && !masterLoopId) { // Ensure loop isn't already running
+    if (activeGridPlayers.length > 0 && !masterLoopId) {
         masterLoopId = requestAnimationFrame(mainAnimationLoop);
     }
 }
@@ -961,41 +1023,84 @@ document.addEventListener('DOMContentLoaded', async () => {
 // Renamed and adapted for grid player objects
 // Updated renderGridVideoFrame to handle scaling
 function renderGridVideoFrame(player) {
-    if (!player || !player.frames || player.frames.length === 0) return;
+    if (!player || player.totalFrames === 0) {
+        // console.warn("GridRender: Invalid player or no frames for player", player ? player.sender : 'unknown');
+        return; // Nothing to render
+    }
 
-    const frameToPlay = player.frames[player.currentFrameIndex];
-    let decompressedData;
-    let currentPixelData; // Uint8Array of 160x160 grayscale pixels
+    // Ensure data is prepared (blobs decompressed)
+    if (!player.reconstructedIBaseFrameData && player.firstFrameCompressed) {
+        player.prepareForPlayback(); // Attempt to decompress if not done
+        if (!player.reconstructedIBaseFrameData) {
+            console.warn(`GridRender: I-Frame for ${player.sender} not ready/failed decompression.`);
+            // Optionally draw an error state on canvas
+            player.ctx.fillStyle = 'orange';
+            player.ctx.fillText('I-ERR', player.canvas.width/2, player.canvas.height/2);
+            return;
+        }
+    }
+    if (player.diffLengths && player.diffLengths.length > 0 && !player.decompressedDiffsBlob && player.allDiffsCompressedBlob) {
+        player.prepareForPlayback();
+        if (!player.decompressedDiffsBlob) {
+            console.warn(`GridRender: P-Frames for ${player.sender} not ready/failed decompression.`);
+            // Optionally draw an error state on canvas
+            player.ctx.fillStyle = 'orange';
+            player.ctx.fillText('P-ERR', player.canvas.width/2, player.canvas.height/2);
+            return;
+        }
+    }
+
+    let currentFramePixelData; // This will be the Uint8Array of 160x160 grayscale pixels for the target frame
 
     try {
-        // --- Frame Reconstruction Logic (remains the same) ---
-        if (frameToPlay.type === 'full') {
-            decompressedData = pako.inflate(frameToPlay.compressedData);
-            currentPixelData = new Uint8Array(decompressedData);
-            player.reconstructedFrameData = currentPixelData;
-        } else { // type === 'diff'
-            if (!player.reconstructedFrameData) {
-                 console.warn('Grid: Cannot reconstruct diff frame without a previous full frame for player', player.sender);
-                const firstFull = player.frames.find(f => f.type === 'full');
-                if(firstFull) {
-                    player.reconstructedFrameData = new Uint8Array(pako.inflate(firstFull.compressedData));
-                } else {
-                    return; 
-                }
+        if (player.currentFrameIndex === 0) { // This is the I-frame (first frame)
+            if (!player.reconstructedIBaseFrameData) {
+                console.warn(`GridRender: I-frame data missing for player ${player.sender}`);
+                return;
             }
-            decompressedData = pako.inflate(frameToPlay.compressedData);
-            const diffArray = deserializeDiff(new Uint8Array(decompressedData));
-            currentPixelData = new Uint8Array(player.reconstructedFrameData); // Copy
-            for (const diff of diffArray) {
-                if (diff.index < currentPixelData.length) { 
-                    currentPixelData[diff.index] = diff.value;
-                }
+            currentFramePixelData = player.reconstructedIBaseFrameData;
+            player.currentPFramePixelData = player.reconstructedIBaseFrameData; // Set base for next P-frame
+        } else { // This is a P-frame (diff frame)
+            if (!player.decompressedDiffsBlob || !player.diffLengths || player.currentFrameIndex > player.diffLengths.length) {
+                console.warn(`GridRender: P-frame data missing or index out of bounds for ${player.sender}, index ${player.currentFrameIndex -1}`);
+                return;
             }
-            player.reconstructedFrameData = currentPixelData;
-        }
-        // --- End Frame Reconstruction Logic ---
+            if (!player.currentPFramePixelData) {
+                // This should ideally not happen if I-frame was processed first.
+                // Fallback: use I-frame as base if current P-frame state is lost.
+                console.warn(`GridRender: Missing base for P-frame ${player.currentFrameIndex - 1} for ${player.sender}. Using I-frame.`);
+                if (!player.reconstructedIBaseFrameData) return; // Cannot proceed
+                player.currentPFramePixelData = player.reconstructedIBaseFrameData;
+            }
 
-        // --- Drawing & Scaling Logic ---
+            // Calculate offset and length for the current diff in the decompressed blob
+            const diffIndexInArray = player.currentFrameIndex - 1; // 0-indexed for diffLengths array
+            let offset = 0;
+            for (let i = 0; i < diffIndexInArray; i++) {
+                offset += player.diffLengths[i];
+            }
+            const currentDiffLength = player.diffLengths[diffIndexInArray];
+            const serializedDiff = player.decompressedDiffsBlob.subarray(offset, offset + currentDiffLength);
+            
+            const diffArray = deserializeDiff(serializedDiff);
+            
+            // Apply diff to the *previous* frame's pixel data (which is stored in player.currentPFramePixelData)
+            let newPFrameData = new Uint8Array(player.currentPFramePixelData); // Copy previous frame
+            for (const diff of diffArray) {
+                if (diff.index < newPFrameData.length) { 
+                    newPFrameData[diff.index] = diff.value;
+                }
+            }
+            currentFramePixelData = newPFrameData;
+            player.currentPFramePixelData = newPFrameData; // Update current P-frame state for the next diff
+        }
+
+        if (!currentFramePixelData) {
+            console.warn(`GridRender: No pixel data to render for frame ${player.currentFrameIndex} of ${player.sender}`);
+            return;
+        }
+
+        // --- Drawing & Scaling Logic (remains largely the same) ---
         const gridCanvas = player.canvas;
         const gridCtx = player.ctx;
         const gridWidth = gridCanvas.width;
@@ -1003,10 +1108,10 @@ function renderGridVideoFrame(player) {
 
         // Create ImageData for the source resolution (160x160)
         const sourceImageData = gridCtx.createImageData(FRAME_WIDTH, FRAME_HEIGHT);
-        for (let i = 0, j = 0; i < currentPixelData.length; i++, j += 4) {
-            sourceImageData.data[j]     = currentPixelData[i];
-            sourceImageData.data[j + 1] = currentPixelData[i];
-            sourceImageData.data[j + 2] = currentPixelData[i];
+        for (let i = 0, j = 0; i < currentFramePixelData.length; i++, j += 4) {
+            sourceImageData.data[j]     = currentFramePixelData[i];
+            sourceImageData.data[j + 1] = currentFramePixelData[i];
+            sourceImageData.data[j + 2] = currentFramePixelData[i];
             sourceImageData.data[j + 3] = 255;
         }
         
@@ -1050,7 +1155,7 @@ function mainAnimationLoop(timestamp) {
                 player.renderNoiseFrame();
             } else { // Assumes it's GridPlayerData or similar with frames
                 renderGridVideoFrame(player);
-                player.currentFrameIndex = (player.currentFrameIndex + 1) % player.frames.length;
+                player.currentFrameIndex = (player.currentFrameIndex + 1) % player.totalFrames;
             }
             player.lastFrameRenderTime = timestamp;
         }
@@ -1154,14 +1259,49 @@ modalSaveButton.addEventListener('click', async () => {
         return; 
     }
 
-    modalStatusElement.textContent = 'Preparing frame data...';
-    const framesAsBytes = recordedFrames.map(frame => bytesToHex(frame.compressedData));
+    modalStatusElement.textContent = 'Preparing frame data for new contract structure...';
+    
+    const firstFrameData = recordedFrames.find(frame => frame.type === 'full');
+    if (!firstFrameData || !firstFrameData.compressedData) {
+        modalStatusElement.textContent = 'Error: First frame data is missing or invalid.';
+        console.error('Save error: First frame (full) not found or data missing in recordedFrames.');
+        modalRecordButton.disabled = false;
+        modalSaveButton.disabled = false;
+        return;
+    }
+    const firstFrameBytes = bytesToHex(firstFrameData.compressedData);
 
-    modalStatusElement.textContent = 'Encoding transaction...';
+    const diffFramesRaw = recordedFrames.filter(frame => frame.type === 'raw_diff');
+    const diffLengths = diffFramesRaw.map(frame => frame.originalLength); // Array of uint32 lengths
+
+    let concatenatedRawDiffsArray;
+    if (diffFramesRaw.length > 0) {
+        // Concatenate all serializedData from raw_diff frames
+        const totalRawDiffsLength = diffFramesRaw.reduce((sum, frame) => sum + frame.originalLength, 0);
+        concatenatedRawDiffsArray = new Uint8Array(totalRawDiffsLength);
+        let offset = 0;
+        for (const frame of diffFramesRaw) {
+            concatenatedRawDiffsArray.set(frame.serializedData, offset);
+            offset += frame.originalLength;
+        }
+    } else {
+        concatenatedRawDiffsArray = new Uint8Array(0); // Empty array if no diffs
+    }
+    
+    const compressedDiffsBytes = bytesToHex(pako.deflate(concatenatedRawDiffsArray));
+
+    console.log('--- Data for setFrames ---');
+    console.log('First Frame (compressed) length:', firstFrameData.compressedData.byteLength);
+    console.log('Number of Diffs:', diffFramesRaw.length);
+    console.log('Diff Lengths Array:', diffLengths);
+    console.log('Total size of concatenated raw diffs before compression:', concatenatedRawDiffsArray.byteLength);
+    console.log('Size of compressed diffs blob:', hexToBytes(compressedDiffsBytes).byteLength);
+
+    modalStatusElement.textContent = 'Encoding transaction for new contract...';
     const callData = encodeFunctionData({
         abi: frameRecorderAbi,
         functionName: 'setFrames',
-        args: [framesAsBytes, currentUserFid],
+        args: [firstFrameBytes, compressedDiffsBytes, diffLengths, currentUserFid],
     });
 
     modalStatusElement.textContent = 'Requesting signature via Frame...';
@@ -1206,3 +1346,4 @@ modalSaveButton.addEventListener('click', async () => {
     modalSaveButton.disabled = false;
   }
 });
+
