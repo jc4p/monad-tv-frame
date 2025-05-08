@@ -976,7 +976,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
         await frame.sdk.actions.ready();
         console.log('Frame SDK ready signal sent.');
-        const context = await frame.sdk.getContext();
+        const context = await frame.sdk.context
         if (context && context.user && context.user.fid) {
             currentUserFid = BigInt(context.user.fid);
             console.log('Frame User FID:', currentUserFid);
@@ -985,14 +985,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             console.log('Frame context/user not available. FID features for saving disabled.');
         }
         // Load videos after SDK init and FID check
-        // loadAndDisplayGridVideos(); // Old call, replaced by setupDynamicGrid
     } catch (e) {
         console.warn('Frame SDK context error or not in Frame environment:', e.message);
         // Attempt to load grid videos even if Frame SDK fails for non-frame environments
         if (!FRAME_RECORDER_CONTRACT_ADDRESS || FRAME_RECORDER_CONTRACT_ADDRESS === '0xYourUpdatedContractAddressHere') {
             // videoGridContainer.innerHTML = '<p style="color:orange;">Contract address not set. Update main.js.</p>'; // Handled by loadAndDisplayGridVideos
-        } else {
-            // loadAndDisplayGridVideos();  // Old call
         }
     } finally {
         setupDynamicGrid(); // Initial setup
