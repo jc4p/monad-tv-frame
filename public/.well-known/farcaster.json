@@ -1,0 +1,17 @@
+{
+  "accountAssociation": {
+    "header": "eyJmaWQiOjk3NzIzMywidHlwZSI6ImN1c3RvZHkiLCJrZXkiOiIweGE2N0JhMDI4MTIzMWVCOUUyZWE0Y0Y5Nzg5NGMwYjBiNUI4MDFDYzYifQ",
+    "payload": "eyJkb21haW4iOiJtb25hZC10di5rYXNyYS5jb2RlcyJ9",
+    "signature": "MHg0YjRhMjI5ZjA4ZThmYzExYTJmNWExOWFmMDQ3ZWI4MjJjZTU3MGNiNzgwYmNhMjg1YTdlZDM3YzA4OTYyZDc5NTg4MjMxNGU1MDI3NmIxZmM0ZWJiN2Q5N2RkZGY3YjM0MmZlNTE5N2YwYjIyZjFiZjhiY2MxMDU1NTJiYmMyMjFi"
+  },
+  "frame": {
+    "version": "1",
+    "name": "Monad TV",
+    "iconUrl": "https://cover-art.kasra.codes/monad_tv_square.png",
+    "homeUrl": "https://monad-tv.kasra.codes",
+    "imageUrl": "https://cover-art.kasra.codes/monad_tv_rectangle.png",
+    "buttonTitle": "Tune In",
+    "splashImageUrl": "https://cover-art.kasra.codes/monad_tv_square.png",
+    "splashBackgroundColor": "#000000"
+  }
+}
