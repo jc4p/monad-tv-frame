@@ -57,6 +57,7 @@ const modalRecordButton = document.getElementById('modalRecordButton');   // Rec
 const modalPlayButton = document.getElementById('modalPlayButton');     // Play button inside the modal
 const modalSaveButton = document.getElementById('modalSaveButton');     // Save button inside the modal
 const modalStatusElement = document.getElementById('modalStatus');        // Status message element inside the modal
+const modalSizeDisplay = document.getElementById('modalSizeDisplay');    // New element for persistent size display
 
 const FPS = 5;
 const FPS_GRID = 10;
@@ -271,6 +272,7 @@ function closeRecordModal() {
     playbackInterval = null;
   }
   modalStatusElement.textContent = '';
+  if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size display on close
 }
 
 // Event Listeners for Modal
@@ -300,6 +302,7 @@ openRecordModalButton.addEventListener('click', () => {
       modalSaveButton.style.display = 'none';
       modalRecordButton.textContent = 'Start Recording';
       modalRecordButton.disabled = true; // Will be enabled after preview setup
+      if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size display on open
 
       videoElement.srcObject = stream;
 
@@ -396,6 +399,7 @@ modalRecordButton.addEventListener('click', async () => {
   
   // --- This is STARTING a new recording ---
   stopLivePreview(); // Explicitly stop live preview first
+  if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size display when starting new recording
 
   if (playbackInterval) { // Stop modal playback if it's running
     clearInterval(playbackInterval);
@@ -1324,7 +1328,11 @@ modalSaveButton.addEventListener('click', async () => {
   console.log(`Estimated Total Bytes for Contract (I-frame + Compressed P-frames blob): ${estimatedTotalSizeForContract} bytes (${(estimatedTotalSizeForContract/1024).toFixed(2)} KB)`);
   
   // Update modal status with estimated size before proceeding
-  modalStatusElement.textContent = `Processed data. Est. on-chain size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB. Connecting...`;
+  // modalStatusElement.textContent = `Processed data. Est. on-chain size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB. Connecting...`; // Keep main status dynamic
+  // Update the dedicated size display element
+  if (modalSizeDisplay) {
+    modalSizeDisplay.textContent = `Est. On-Chain Size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB`;
+  }
   
   // --- End: Frame data processing and compression --- 
 
