@@ -236,18 +236,57 @@ async function openRecordModal() {
   modalSaveButton.style.display = 'none';
   modalRecordButton.textContent = 'Start Recording';
   modalRecordButton.disabled = true; // Disable until webcam is ready
-  modalStatusElement.textContent = 'Initializing webcam...';
+  modalStatusElement.textContent = 'Requesting webcam access...'; // Updated initial message
 
-  const webcamStarted = await startWebcam();
+  try {
+    // Call getUserMedia directly and as the first async operation in this handler path
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 320 },
+        height: { ideal: 240 }
+      },
+      audio: false
+    });
 
-  if (webcamStarted) {
+    // If getUserMedia is successful, proceed with setting up the video element
+    videoElement.srcObject = stream;
+    modalStatusElement.textContent = 'Initializing webcam preview...'; // Update status
+
+    // Promise to handle video element readiness and play
+    await new Promise((resolve, reject) => {
+        videoElement.onloadedmetadata = () => {
+            console.log(`Webcam stream started: ${videoElement.videoWidth}x${videoElement.videoHeight}. Live preview on canvas will be ${FRAME_WIDTH}x${FRAME_HEIGHT} grayscale at ${FPS}FPS.`);
+            videoElement.play().then(() => {
+                console.log("Video element play() successful after metadata loaded.");
+                resolve();
+            }).catch(e => {
+                console.error("Error attempting to play video after metadata loaded:", e);
+                reject(e); // Reject if play fails
+            });
+        };
+        videoElement.onended = () => {
+            stopLivePreview(); // This is fine, handles stream ending
+            console.log('Webcam stream ended.');
+            // If it ends unexpectedly, it's not a "successful start" for the modal
+        };
+        videoElement.onerror = (e) => { // Catch video element errors
+            console.error('Video element error:', e);
+            reject(new Error('Video element error.'));
+        };
+    });
+
+    // Webcam started and playing successfully
     startLivePreview(); // Start live preview only if webcam is successful
     modalStatusElement.textContent = 'Ready to record.';
     modalRecordButton.disabled = false; // Enable record button
-  } else {
+
+  } catch (error) {
+    // This catch block handles errors from getUserMedia or the video setup promise
+    console.error('Error accessing or starting webcam in openRecordModal:', error);
     // Enhanced error message
     modalStatusElement.textContent = 'Error: Webcam access failed. Please grant permissions. On iOS, this may require updated Farcaster client support.';
-    modalRecordButton.disabled = true; 
+    modalRecordButton.disabled = true;
+    stopLivePreview(); // Ensure cleanup if partial start or error after getting stream
   }
 }
 
