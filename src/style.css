@@ -35,8 +35,14 @@ body {
   text-align: center;
 }
 
-video#webcam {
-  display: none !important;
+#webcam {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 160px;
+  height: 120px;
+  clip-path: inset(0 160px 120px 0);
+  pointer-events: none;
 }
 
 canvas#frameCanvas {
