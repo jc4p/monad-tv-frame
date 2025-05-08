@@ -1383,15 +1383,17 @@ modalSaveButton.addEventListener('click', async () => {
                 method: 'wallet_switchEthereumChain',
                 params: [{ chainId: '0x' + MONAD_TESTNET_CHAIN_ID.toString(16) }],
             });
-            modalStatusElement.textContent = 'Network switched. Please click "Save to Monad" again.';
-            console.log('Network switched to Monad Testnet. User should re-initiate save.');
+            // Network switched successfully, update status and proceed
+            modalStatusElement.textContent = 'Network switched. Proceeding with save...'; 
+            console.log('Network switched to Monad Testnet. Automatically retrying save.');
         } catch (switchError) {
             console.error('Failed to switch network:', switchError);
             modalStatusElement.textContent = `Error: Failed to switch to Monad Testnet. Please switch manually.`;
-        }
-        modalRecordButton.disabled = false;
-        modalSaveButton.disabled = false;
-        return; 
+            // Re-enable buttons on failure to switch
+            modalRecordButton.disabled = false;
+            modalSaveButton.disabled = false;
+            return; // Stop if switching failed
+        } 
     }
 
     modalStatusElement.textContent = 'Encoding transaction for new contract...';
@@ -1420,9 +1422,14 @@ modalSaveButton.addEventListener('click', async () => {
     if (receipt.status === 'success') {
       modalStatusElement.textContent = 'Video saved successfully to Monad!';
       console.log('Save transaction successful via Frame SDK:', receipt);
+      // Refresh grid after a short delay
       setTimeout(() => {
         setupDynamicGrid();
-      }, 1500); // Slightly increased delay for chain propagation if needed
+      }, 1500); 
+      // Close modal after a slightly longer delay
+      setTimeout(() => {
+        closeRecordModal();
+      }, 2500); // e.g., 2.5 seconds after success confirmation
     } else {
       modalStatusElement.textContent = 'Transaction failed. Check console for details.';
       console.error('Save transaction failed via Frame SDK:', receipt);
