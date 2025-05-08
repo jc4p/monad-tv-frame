@@ -271,7 +271,7 @@ openRecordModalButton.addEventListener('click', () => {
 
   // 2) Immediately invoke getUserMedia (no async/await before it)
   navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 320 }, height: { ideal: 240 } },
+    video: true,
     audio: false
   })
   .then(stream => {
