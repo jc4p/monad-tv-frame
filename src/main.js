@@ -1196,6 +1196,55 @@ modalSaveButton.addEventListener('click', async () => {
     return;
   }
 
+  // --- Start: Frame data processing and compression (moved earlier for logging) --- 
+  modalStatusElement.textContent = 'Processing frame data for compression metrics...';
+  
+  const firstFrameData = recordedFrames.find(frame => frame.type === 'full');
+  if (!firstFrameData || !firstFrameData.compressedData) {
+      modalStatusElement.textContent = 'Error: First frame data is missing or invalid.';
+      console.error('Save error: First frame (full) not found or data missing in recordedFrames.');
+      modalRecordButton.disabled = false;
+      modalSaveButton.disabled = false;
+      return;
+  }
+  const firstFrameBytesForContract = bytesToHex(firstFrameData.compressedData);
+
+  const diffFramesRaw = recordedFrames.filter(frame => frame.type === 'raw_diff');
+  const diffLengthsForContract = diffFramesRaw.map(frame => frame.originalLength); 
+
+  let concatenatedRawDiffsArray;
+  if (diffFramesRaw.length > 0) {
+      const totalRawDiffsLength = diffFramesRaw.reduce((sum, frame) => sum + frame.originalLength, 0);
+      concatenatedRawDiffsArray = new Uint8Array(totalRawDiffsLength);
+      let offset = 0;
+      for (const frame of diffFramesRaw) {
+          concatenatedRawDiffsArray.set(frame.serializedData, offset);
+          offset += frame.originalLength;
+      }
+  } else {
+      concatenatedRawDiffsArray = new Uint8Array(0); 
+  }
+  
+  const compressedDiffsBytesForContract = bytesToHex(pako.deflate(concatenatedRawDiffsArray));
+
+  // --- Output Compression Metrics --- 
+  console.log('--- Pre-Save Compression Metrics ---');
+  console.log(`Recorded Frames Count: ${recordedFrames.length}`);
+  console.log(`First Frame (I-Frame) Compressed Size: ${firstFrameData.compressedData.byteLength} bytes`);
+  console.log(`Number of Diff Frames (P-Frames): ${diffFramesRaw.length}`);
+  if (diffFramesRaw.length > 0) {
+    console.log(`Total Size of Concatenated RAW Serialized Diffs (before final compression): ${concatenatedRawDiffsArray.byteLength} bytes`);
+    console.log(`Final Compressed Size of All Diffs Blob (P-Frames): ${hexToBytes(compressedDiffsBytesForContract).byteLength} bytes`);
+    const savings = concatenatedRawDiffsArray.byteLength - hexToBytes(compressedDiffsBytesForContract).byteLength;
+    const percentageSavings = concatenatedRawDiffsArray.byteLength > 0 ? (savings / concatenatedRawDiffsArray.byteLength * 100).toFixed(2) : 0;
+    console.log(`Compression Savings on Diffs Blob: ${savings} bytes (${percentageSavings}%)`);
+  } else {
+    console.log('No diff frames to compress.');
+  }
+  const estimatedTotalSizeForContract = firstFrameData.compressedData.byteLength + (diffFramesRaw.length > 0 ? hexToBytes(compressedDiffsBytesForContract).byteLength : 0);
+  console.log(`Estimated Total Bytes for Contract (I-frame + Compressed P-frames blob): ${estimatedTotalSizeForContract} bytes (${(estimatedTotalSizeForContract/1024).toFixed(2)} KB)`);
+  // --- End: Frame data processing and compression --- 
+
   // Re-check/ensure currentUserFid is available
   if (!currentUserFid) {
     try {
@@ -1255,8 +1304,6 @@ modalSaveButton.addEventListener('click', async () => {
                 method: 'wallet_switchEthereumChain',
                 params: [{ chainId: '0x' + MONAD_TESTNET_CHAIN_ID.toString(16) }],
             });
-            // After a successful switch, the page often reloads or the user context might change.
-            // It's best to inform the user to try again.
             modalStatusElement.textContent = 'Network switched. Please click "Save to Monad" again.';
             console.log('Network switched to Monad Testnet. User should re-initiate save.');
         } catch (switchError) {
@@ -1268,49 +1315,11 @@ modalSaveButton.addEventListener('click', async () => {
         return; 
     }
 
-    modalStatusElement.textContent = 'Preparing frame data for new contract structure...';
-    
-    const firstFrameData = recordedFrames.find(frame => frame.type === 'full');
-    if (!firstFrameData || !firstFrameData.compressedData) {
-        modalStatusElement.textContent = 'Error: First frame data is missing or invalid.';
-        console.error('Save error: First frame (full) not found or data missing in recordedFrames.');
-        modalRecordButton.disabled = false;
-        modalSaveButton.disabled = false;
-        return;
-    }
-    const firstFrameBytes = bytesToHex(firstFrameData.compressedData);
-
-    const diffFramesRaw = recordedFrames.filter(frame => frame.type === 'raw_diff');
-    const diffLengths = diffFramesRaw.map(frame => frame.originalLength); // Array of uint32 lengths
-
-    let concatenatedRawDiffsArray;
-    if (diffFramesRaw.length > 0) {
-        // Concatenate all serializedData from raw_diff frames
-        const totalRawDiffsLength = diffFramesRaw.reduce((sum, frame) => sum + frame.originalLength, 0);
-        concatenatedRawDiffsArray = new Uint8Array(totalRawDiffsLength);
-        let offset = 0;
-        for (const frame of diffFramesRaw) {
-            concatenatedRawDiffsArray.set(frame.serializedData, offset);
-            offset += frame.originalLength;
-        }
-    } else {
-        concatenatedRawDiffsArray = new Uint8Array(0); // Empty array if no diffs
-    }
-    
-    const compressedDiffsBytes = bytesToHex(pako.deflate(concatenatedRawDiffsArray));
-
-    console.log('--- Data for setFrames ---');
-    console.log('First Frame (compressed) length:', firstFrameData.compressedData.byteLength);
-    console.log('Number of Diffs:', diffFramesRaw.length);
-    console.log('Diff Lengths Array:', diffLengths);
-    console.log('Total size of concatenated raw diffs before compression:', concatenatedRawDiffsArray.byteLength);
-    console.log('Size of compressed diffs blob:', hexToBytes(compressedDiffsBytes).byteLength);
-
     modalStatusElement.textContent = 'Encoding transaction for new contract...';
     const callData = encodeFunctionData({
         abi: frameRecorderAbi,
         functionName: 'setFrames',
-        args: [firstFrameBytes, compressedDiffsBytes, diffLengths, currentUserFid],
+        args: [firstFrameBytesForContract, compressedDiffsBytesForContract, diffLengthsForContract, currentUserFid],
     });
 
     modalStatusElement.textContent = 'Requesting signature via Frame...';
