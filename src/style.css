@@ -35,6 +35,17 @@ body {
   text-align: center;
 }
 
+#webcam {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  /* remove clip-path / opacity */
+  pointer-events: none;
+  z-index: 10000; /* ensure it’s above any overlay */
+}
+
 canvas#frameCanvas {
   border: 1px solid #ccc;
   margin-bottom: 1rem;
