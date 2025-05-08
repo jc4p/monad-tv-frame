@@ -74,28 +74,26 @@ function startLivePreview() {
   }
   const modalCtx = modalPreviewCanvas.getContext('2d');
   livePreviewInterval = setInterval(() => {
-    if (videoElement.readyState >= videoElement.HAVE_ENOUGH_DATA) {
-      const videoWidth = videoElement.videoWidth;
-      const videoHeight = videoElement.videoHeight;
-      if (videoWidth === 0 || videoHeight === 0) return;
+    const videoWidth = videoElement.videoWidth;
+    const videoHeight = videoElement.videoHeight;
+    if (videoWidth === 0 || videoHeight === 0) return;
 
-      const size = Math.min(videoWidth, videoHeight);
-      const sx = (videoWidth - size) / 2;
-      const sy = (videoHeight - size) / 2;
+    const size = Math.min(videoWidth, videoHeight);
+    const sx = (videoWidth - size) / 2;
+    const sy = (videoHeight - size) / 2;
 
-      // Draw to a temporary canvas to get ImageData for processing
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = FRAME_WIDTH;
-      tempCanvas.height = FRAME_HEIGHT;
-      const tempCtx = tempCanvas.getContext('2d');
-      tempCtx.drawImage(videoElement, sx, sy, size, size, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-      
-      let imageData = tempCtx.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-      imageData = toGrayscale(imageData); 
-      // imageData = adjustBrightness(imageData, 1.20); // Optional: Adjust brightness if needed for preview
+    // Draw to a temporary canvas to get ImageData for processing
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = FRAME_WIDTH;
+    tempCanvas.height = FRAME_HEIGHT;
+    const tempCtx = tempCanvas.getContext('2d');
+    tempCtx.drawImage(videoElement, sx, sy, size, size, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+    
+    let imageData = tempCtx.getImageData(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+    imageData = toGrayscale(imageData); 
+    // imageData = adjustBrightness(imageData, 1.20); // Optional: Adjust brightness if needed for preview
 
-      modalCtx.putImageData(imageData, 0, 0);
-    }
+    modalCtx.putImageData(imageData, 0, 0);
   }, 1000 / FPS); // Using the general FPS for live preview
 }
 
