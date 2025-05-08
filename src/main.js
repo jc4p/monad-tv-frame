@@ -72,6 +72,7 @@ let recordingInterval = null;
 let playbackInterval = null;
 let recordedFrames = [];
 let lastFrameImageData = null;
+let preparedSaveData = null; // To store data prepared by stopRecording for saveButton
 
 // Fallback if not set, and log a warning.
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787'; 
@@ -265,7 +266,7 @@ function closeRecordModal() {
   recordModal.style.display = 'none';
   stopLivePreview();
   if (recordingInterval) {
-    stopRecording(); 
+    stopRecording(); // This will clear recordingInterval
   }
   if (playbackInterval) { // Ensure playback is stopped when modal closes
     clearInterval(playbackInterval);
@@ -273,6 +274,7 @@ function closeRecordModal() {
   }
   modalStatusElement.textContent = '';
   if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size display on close
+  preparedSaveData = null; // Clear prepared data on close
 }
 
 // Event Listeners for Modal
@@ -296,7 +298,7 @@ openRecordModalButton.addEventListener('click', () => {
       }
       recordedFrames = [];
       lastFrameImageData = null;
-      reconstructedModalPlaybackFrame = null;
+      preparedSaveData = null; // Clear any old prepared data
 
       modalPlayButton.style.display = 'none';
       modalSaveButton.style.display = 'none';
@@ -400,6 +402,7 @@ modalRecordButton.addEventListener('click', async () => {
   // --- This is STARTING a new recording ---
   stopLivePreview(); // Explicitly stop live preview first
   if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size display when starting new recording
+  preparedSaveData = null; // Clear any old prepared data
 
   if (playbackInterval) { // Stop modal playback if it's running
     clearInterval(playbackInterval);
@@ -554,7 +557,12 @@ function stopRecording() {
     console.log('Modal Recording: Stopped by call to stopRecording(). Total frames:', recordedFrames.length);
   } else {
     console.log('Modal Recording: stopRecording() called but no active recording interval.');
+    // If called without an active interval, don't proceed with processing
+    return; 
   }
+
+  // Reset prepared data in case this stop doesn't yield valid frames
+  preparedSaveData = null; 
 
   if (recordedFrames.length > 0) {
     modalSaveButton.style.display = 'inline-block'; 
@@ -563,24 +571,66 @@ function stopRecording() {
     modalRecordButton.disabled = false;         
     modalPlayButton.style.display = 'none'; 
     
-    // Calculate total *uncompressed* size for display (approximate, as first frame is compressed)
-    let estimatedTotalUncompressedSizeBytes = 0;
-    if (recordedFrames[0] && recordedFrames[0].type === 'full') {
-        // Estimate original size of full frame (TOTAL_PIXELS for grayscale)
-        estimatedTotalUncompressedSizeBytes += TOTAL_PIXELS; 
+    // --- Perform Final Compression and Size Calculation --- 
+    try {
+      console.log("stopRecording: Processing frames for final size calculation...");
+      const firstFrameData = recordedFrames.find(frame => frame.type === 'full');
+      if (!firstFrameData || !firstFrameData.compressedData) {
+          throw new Error('First frame (full) not found or data missing in recordedFrames.');
+      }
+      const firstFrameBytes = firstFrameData.compressedData; // Uint8Array
+      const firstFrameBytesForContract = bytesToHex(firstFrameBytes);
+
+      const diffFramesRaw = recordedFrames.filter(frame => frame.type === 'raw_diff');
+      const diffLengthsForContract = diffFramesRaw.map(frame => frame.originalLength); 
+
+      let concatenatedRawDiffsArray;
+      if (diffFramesRaw.length > 0) {
+          const totalRawDiffsLength = diffFramesRaw.reduce((sum, frame) => sum + frame.originalLength, 0);
+          concatenatedRawDiffsArray = new Uint8Array(totalRawDiffsLength);
+          let offset = 0;
+          for (const frame of diffFramesRaw) {
+              concatenatedRawDiffsArray.set(frame.serializedData, offset);
+              offset += frame.originalLength;
+          }
+      } else {
+          concatenatedRawDiffsArray = new Uint8Array(0); 
+      }
+      
+      const compressedDiffsBlob = pako.deflate(concatenatedRawDiffsArray); // Uint8Array
+      const compressedDiffsBytesForContract = bytesToHex(compressedDiffsBlob);
+
+      const finalEstimatedTotalSize = firstFrameBytes.byteLength + compressedDiffsBlob.byteLength;
+      console.log(`stopRecording: Final Estimated Total Bytes for Contract: ${finalEstimatedTotalSize} bytes (${(finalEstimatedTotalSize/1024).toFixed(2)} KB)`);
+
+      // Update the dedicated size display element immediately
+      if (modalSizeDisplay) {
+          modalSizeDisplay.textContent = `Est. On-Chain Size: ${(finalEstimatedTotalSize/1024).toFixed(2)} KB`;
+      }
+
+      // Store the prepared data for the save button
+      preparedSaveData = {
+          firstFrameBytesHex: firstFrameBytesForContract,
+          compressedDiffsBytesHex: compressedDiffsBytesForContract,
+          diffLengths: diffLengthsForContract
+      };
+
+      modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview...`;
+      
+    } catch (error) {
+        console.error("Error during final processing in stopRecording:", error);
+        modalStatusElement.textContent = "Error processing recording. Please re-record.";
+        if (modalSizeDisplay) modalSizeDisplay.textContent = "Size calculation failed.";
+        modalSaveButton.disabled = true; // Disable save if processing failed
+        // Don't trigger playback if processing failed
+        stopLivePreview(); // Make sure preview is stopped
+        return; // Exit early
     }
-    recordedFrames.slice(1).forEach(frame => {
-        if (frame.type === 'raw_diff') {
-            estimatedTotalUncompressedSizeBytes += frame.originalLength;
-        }
-    });
-    const estimatedTotalUncompressedSizeKB = (estimatedTotalUncompressedSizeBytes / 1024).toFixed(2);
-    
-    modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview... (Raw size ~${estimatedTotalUncompressedSizeKB} KB)`;
+    // --- End Final Compression --- 
     
     stopLivePreview(); 
 
-    modalPlayButton.click(); 
+    modalPlayButton.click(); // Trigger auto-play
 
   } else {
     modalStatusElement.textContent = 'Recording stopped early or failed.';
@@ -588,24 +638,10 @@ function stopRecording() {
     modalRecordButton.disabled = false;
     modalPlayButton.style.display = 'none'; 
     modalSaveButton.style.display = 'none'; 
+    if (modalSizeDisplay) modalSizeDisplay.textContent = ''; // Clear size on failure too
     if (recordModal.style.display === 'flex' && !livePreviewInterval) { 
         startLivePreview(); 
     }
-  }
-  
-  // Log summary including total size
-  const recordingTimestamp = new Date().toISOString();
-  console.log('--- Modal Recording Summary ---');
-  if(currentUserFid) console.log(`FID (from Frame SDK): ${currentUserFid}`);
-  console.log(`Timestamp: ${recordingTimestamp}`);
-  console.log(`Total Frames: ${recordedFrames.length}`);
-  if (recordedFrames.length > 0 && recordedFrames[0] && recordedFrames[0].type === 'full' && recordedFrames[0].compressedData) {
-    console.log(`Size of first frame (compressed): ${recordedFrames[0].compressedData.byteLength} bytes (${(recordedFrames[0].compressedData.byteLength / 1024).toFixed(2)} KB)`);
-    let totalRawDiffSize = 0;
-    recordedFrames.slice(1).forEach(frame => {
-        if (frame.type === 'raw_diff') totalRawDiffSize += frame.originalLength;
-    });
-    console.log(`Total size of raw serialized diffs: ${totalRawDiffSize} bytes (${(totalRawDiffSize / 1024).toFixed(2)} KB)`);
   }
 }
 
@@ -1272,69 +1308,32 @@ modalSaveButton.addEventListener('click', async () => {
   modalSaveButton.disabled = true;
   modalStatusElement.textContent = 'Preparing to save...';
 
-  if (!recordedFrames || recordedFrames.length === 0) {
-    modalStatusElement.textContent = 'No recorded frames to save.';
+  // Data should already be processed and stored in preparedSaveData by stopRecording
+  if (!preparedSaveData) {
+    modalStatusElement.textContent = 'Error: Processed recording data not found. Please re-record.';
+    console.error('Save Error: preparedSaveData is null or missing.');
     modalRecordButton.disabled = false;
     modalSaveButton.disabled = false;
     return;
   }
 
-  // --- Start: Frame data processing and compression (moved earlier for logging) --- 
-  modalStatusElement.textContent = 'Processing frame data for compression metrics...';
+  // --- Remove Old Data Processing Section --- 
+  // (All the logic calculating firstFrameBytesForContract, diffs etc. is GONE from here)
+  // --- End Remove Old Data Processing Section --- 
   
-  const firstFrameData = recordedFrames.find(frame => frame.type === 'full');
-  if (!firstFrameData || !firstFrameData.compressedData) {
-      modalStatusElement.textContent = 'Error: First frame data is missing or invalid.';
-      console.error('Save error: First frame (full) not found or data missing in recordedFrames.');
-      modalRecordButton.disabled = false;
-      modalSaveButton.disabled = false;
-      return;
-  }
-  const firstFrameBytesForContract = bytesToHex(firstFrameData.compressedData);
-
-  const diffFramesRaw = recordedFrames.filter(frame => frame.type === 'raw_diff');
-  const diffLengthsForContract = diffFramesRaw.map(frame => frame.originalLength); 
-
-  let concatenatedRawDiffsArray;
-  if (diffFramesRaw.length > 0) {
-      const totalRawDiffsLength = diffFramesRaw.reduce((sum, frame) => sum + frame.originalLength, 0);
-      concatenatedRawDiffsArray = new Uint8Array(totalRawDiffsLength);
-      let offset = 0;
-      for (const frame of diffFramesRaw) {
-          concatenatedRawDiffsArray.set(frame.serializedData, offset);
-          offset += frame.originalLength;
-      }
-  } else {
-      concatenatedRawDiffsArray = new Uint8Array(0); 
-  }
+  // --- Start using preparedSaveData --- 
+  const { 
+    firstFrameBytesHex, 
+    compressedDiffsBytesHex, 
+    diffLengths 
+  } = preparedSaveData;
   
-  const compressedDiffsBytesForContract = bytesToHex(pako.deflate(concatenatedRawDiffsArray));
-
-  // --- Output Compression Metrics --- 
-  console.log('--- Pre-Save Compression Metrics ---');
-  console.log(`Recorded Frames Count: ${recordedFrames.length}`);
-  console.log(`First Frame (I-Frame) Compressed Size: ${firstFrameData.compressedData.byteLength} bytes`);
-  console.log(`Number of Diff Frames (P-Frames): ${diffFramesRaw.length}`);
-  if (diffFramesRaw.length > 0) {
-    console.log(`Total Size of Concatenated RAW Serialized Diffs (before final compression): ${concatenatedRawDiffsArray.byteLength} bytes`);
-    console.log(`Final Compressed Size of All Diffs Blob (P-Frames): ${hexToBytes(compressedDiffsBytesForContract).byteLength} bytes`);
-    const savings = concatenatedRawDiffsArray.byteLength - hexToBytes(compressedDiffsBytesForContract).byteLength;
-    const percentageSavings = concatenatedRawDiffsArray.byteLength > 0 ? (savings / concatenatedRawDiffsArray.byteLength * 100).toFixed(2) : 0;
-    console.log(`Compression Savings on Diffs Blob: ${savings} bytes (${percentageSavings}%)`);
-  } else {
-    console.log('No diff frames to compress.');
-  }
-  const estimatedTotalSizeForContract = firstFrameData.compressedData.byteLength + (diffFramesRaw.length > 0 ? hexToBytes(compressedDiffsBytesForContract).byteLength : 0);
-  console.log(`Estimated Total Bytes for Contract (I-frame + Compressed P-frames blob): ${estimatedTotalSizeForContract} bytes (${(estimatedTotalSizeForContract/1024).toFixed(2)} KB)`);
-  
-  // Update modal status with estimated size before proceeding
-  // modalStatusElement.textContent = `Processed data. Est. on-chain size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB. Connecting...`; // Keep main status dynamic
-  // Update the dedicated size display element
-  if (modalSizeDisplay) {
-    modalSizeDisplay.textContent = `Est. On-Chain Size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB`;
-  }
-  
-  // --- End: Frame data processing and compression --- 
+  // Optional: Log the sizes being used from prepared data 
+  console.log('--- Using Prepared Data for Save ---');
+  console.log(`First Frame Size (bytes): ${hexToBytes(firstFrameBytesHex).byteLength}`);
+  console.log(`Compressed Diffs Blob Size (bytes): ${hexToBytes(compressedDiffsBytesHex).byteLength}`);
+  console.log(`Number of Diffs (lengths array): ${diffLengths.length}`);
+  // --- End using preparedSaveData --- 
 
   // Re-check/ensure currentUserFid is available
   if (!currentUserFid) {
@@ -1412,7 +1411,8 @@ modalSaveButton.addEventListener('click', async () => {
     const callData = encodeFunctionData({
         abi: frameRecorderAbi,
         functionName: 'setFrames',
-        args: [firstFrameBytesForContract, compressedDiffsBytesForContract, diffLengthsForContract, currentUserFid],
+        // Use the data retrieved from preparedSaveData
+        args: [firstFrameBytesHex, compressedDiffsBytesHex, diffLengths, currentUserFid],
     });
 
     modalStatusElement.textContent = 'Requesting signature via Frame...';
