@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta name="fc:frame" content='{"version":"next","imageUrl":"https://cover-art.kasra.codes/monad_tv_rectangle.png","button":{"title":"Tune In","action":{"type":"launch_frame","name":"Monad TV","url":"https://monad-tv.kasra.codes","splashImageUrl":"https://cover-art.kasra.codes/monad_tv_square.png","splashBackgroundColor":"#000000"}}}' />
+    <title>Monad TV</title>
+    <link rel="stylesheet" href="/src/style.css">
+  </head>
+  <body>
+    <div id="app">
+      <button id="openRecordModalButton" class="primary-action-button">Submit New Video</button>
+
+      <div id="videoGridContainer">
+        <!-- Grid videos will be populated here by JavaScript -->
+      </div>
+    </div>
+
+    <!-- Recording Modal Structure -->
+    <div id="recordModal" class="modal-overlay" style="display: none;">
+      <div class="modal-content">
+        <button id="closeRecordModalButton" class="modal-close-button">&times;</button>
+        <h2>Record Your Clip</h2>
+        <canvas id="modalPreviewCanvas" width="240" height="240"></canvas>
+        <div class="modal-controls">
+          <button id="modalRecordButton">Start Recording</button>
+          <button id="modalPlayButton" style="display: none;">Play Preview</button>
+          <button id="modalSaveButton" style="display: none;">Save to Monad</button>
+        </div>
+        <p id="modalStatus"></p>
+      </div>
+    </div>
+
+    <!-- Hidden video element for webcam stream source -->
+    <video id="webcam" autoplay playsinline muted style="position: absolute; top: -9999px; left: -9999px; width: 1px; height: 1px;"></video>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
