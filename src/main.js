@@ -245,8 +245,8 @@ async function openRecordModal() {
     modalStatusElement.textContent = 'Ready to record.';
     modalRecordButton.disabled = false; // Enable record button
   } else {
-    modalStatusElement.textContent = 'Error: Webcam access failed. Please grant permissions and try again.';
-    // Keep record button disabled, or provide a retry mechanism, or suggest closing modal
+    // Enhanced error message
+    modalStatusElement.textContent = 'Error: Webcam access failed. Please grant permissions. On iOS, this may require updated Farcaster client support.';
     modalRecordButton.disabled = true; 
   }
 }
