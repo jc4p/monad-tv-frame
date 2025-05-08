@@ -889,6 +889,7 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
     videoGridContainer.insertAdjacentElement('afterbegin', loadingMessage);
 
     try {
+        console.log(`Grid: Attempting to get logs for contract ${FRAME_RECORDER_CONTRACT_ADDRESS}...`);
         const videoClipUpdatedLogs = await client.getLogs({
             address: FRAME_RECORDER_CONTRACT_ADDRESS,
             event: parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)'),
@@ -896,27 +897,35 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
             toBlock: 'latest'
         });
 
+        console.log('Grid: videoClipUpdatedLogs raw result:', JSON.stringify(videoClipUpdatedLogs, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
+
         if (videoGridContainer.contains(loadingMessage)) {
             videoGridContainer.removeChild(loadingMessage);
         }
 
-        if (videoClipUpdatedLogs.length === 0) {
-            console.log('No video logs found on contract. Displaying noise only.');
+        if (!videoClipUpdatedLogs || videoClipUpdatedLogs.length === 0) {
+            console.log('Grid: No VideoClipUpdated logs found on contract. Displaying noise only.');
         } else {
             videoClipUpdatedLogs.sort((a, b) => Number(b.args.timestamp) - Number(a.args.timestamp));
             const latestUpdates = new Map();
             videoClipUpdatedLogs.forEach(log => {
-                if (!latestUpdates.has(log.args.user)) {
-                    latestUpdates.set(log.args.user, { fid: log.args.fid, timestamp: log.args.timestamp });
+                if (log.args && log.args.user) { // Ensure args and user exist
+                    if (!latestUpdates.has(log.args.user)) {
+                        latestUpdates.set(log.args.user, { fid: log.args.fid, timestamp: log.args.timestamp });
+                    }
+                } else {
+                    console.warn('Grid: Log entry missing args or args.user:', log);
                 }
             });
+            console.log('Grid: latestUpdates map:', latestUpdates);
 
             let contractVideosLoaded = 0;
             for (const [userAddress, { fid, timestamp }] of latestUpdates.entries()) {
+                console.log(`Grid: Processing latest update for user: ${userAddress}, FID: ${fid}, Timestamp: ${timestamp}`);
                 if (contractVideosLoaded >= totalCells) break;
 
                 try {
-                    // Fetch data using the new getFullClipData function
+                    console.log(`Grid: Calling getFullClipData for user ${userAddress}`);
                     const clipData = await client.readContract({
                         address: FRAME_RECORDER_CONTRACT_ADDRESS, 
                         abi: frameRecorderAbi,
@@ -924,36 +933,34 @@ async function loadAndDisplayGridVideos(totalCells) { // Added totalCells parame
                         args: [userAddress]
                     });
                     
-                    // clipData will be an object/array with firstFrame, compressedDiffs, diffLengths, fid, timestamp
-                    // The contract returns them as positional array: [firstFrame, compressedDiffs, diffLengths, fid, timestamp]
+                    console.log(`Grid: Raw clipData for ${userAddress}:`, JSON.stringify(clipData, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
+
                     const structuredClipData = {
                         firstFrame: clipData[0],
                         compressedDiffs: clipData[1],
-                        diffLengths: clipData[2].map(len => Number(len)), // Ensure diffLengths are numbers
+                        diffLengths: clipData[2].map(len => Number(len)),
                         fid: clipData[3],
                         timestamp: clipData[4]
                     };
+                    console.log(`Grid: Structured clipData for ${userAddress}:`, structuredClipData);
 
-                    // Basic validation: check if firstFrame exists
                     if (!structuredClipData.firstFrame || structuredClipData.firstFrame === '0x' || hexToBytes(structuredClipData.firstFrame).length === 0) {
                         console.warn(`Grid: No valid firstFrame data for user ${userAddress}, FID ${fid}. Skipping.`);
                         continue;
                     }
 
-                    // Replace a noise player with this contract video player
                     if (contractVideosLoaded < activeGridPlayers.length) {
                         const targetCanvas = activeGridPlayers[contractVideosLoaded].canvas;
-                        // Pass the structuredClipData to the GridPlayerData constructor
                         activeGridPlayers[contractVideosLoaded] = new GridPlayerData(targetCanvas, structuredClipData, userAddress, fid, timestamp);
-                        // Prepare data for playback (decompress blobs)
                         activeGridPlayers[contractVideosLoaded].prepareForPlayback(); 
+                        console.log(`Grid: Successfully processed and added video for ${userAddress} to activeGridPlayers.`);
                     }
                     contractVideosLoaded++;
                 } catch (userError) {
                     console.error(`Grid: Error loading full clip data for user ${userAddress} (FID: ${fid}):`, userError);
                 }
             }
-            console.log(`Loaded ${contractVideosLoaded} contract videos (new structure) into the grid.`);
+            console.log(`Grid: Loaded ${contractVideosLoaded} contract videos (new structure) into the grid.`);
         }
     } catch (error) {
         console.error('Grid: Error loading video logs or processing videos (new structure):', error);
