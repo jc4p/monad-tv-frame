@@ -265,36 +265,36 @@ function closeRecordModal() {
 
 // Event Listeners for Modal
 openRecordModalButton.addEventListener('click', () => {
-  // Synchronous setup from the old openRecordModal function
+  // 1) Show modal and set initial status text immediately
   recordModal.style.display = 'flex';
-
-  if (playbackInterval) {
-      clearInterval(playbackInterval);
-      playbackInterval = null;
-  }
-  recordedFrames = [];
-  lastFrameImageData = null;
-  reconstructedModalPlaybackFrame = null;
-
-  modalPlayButton.style.display = 'none';
-  modalSaveButton.style.display = 'none';
-  modalRecordButton.textContent = 'Start Recording';
-  modalRecordButton.disabled = true; // Will be enabled on success
   modalStatusElement.textContent = 'Requesting webcam access…';
 
-  // 1) Call getUserMedia() directly, no prior awaits
+  // 2) Immediately invoke getUserMedia (no async/await before it)
   navigator.mediaDevices.getUserMedia({
     video: { width: { ideal: 320 }, height: { ideal: 240 } },
     audio: false
   })
-  // 2) Use .then() so it stays in the same tap/click event
   .then(stream => {
+    // Perform other modal state resets and UI setup *after* stream is acquired
+    if (playbackInterval) {
+        clearInterval(playbackInterval);
+        playbackInterval = null;
+    }
+    recordedFrames = [];
+    lastFrameImageData = null;
+    reconstructedModalPlaybackFrame = null;
+
+    modalPlayButton.style.display = 'none';
+    modalSaveButton.style.display = 'none';
+    modalRecordButton.textContent = 'Start Recording';
+    modalRecordButton.disabled = true; // Disable initially, will be enabled on success
+    
+    // Process the stream
     videoElement.srcObject = stream;
-    modalStatusElement.textContent = 'Initializing webcam preview…';
+    modalStatusElement.textContent = 'Initializing webcam preview…'; // Matched user's example
     console.log(`Webcam stream acquired. Video dimensions: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
 
-    // Create a promise for onloadedmetadata and play
-    // This ensures that play() is called after metadata is loaded
+    // Chain the video.play() promise, wrapped in our onloadedmetadata logic
     return new Promise((resolve, reject) => {
       videoElement.onloadedmetadata = () => {
         console.log(`Webcam metadata loaded: ${videoElement.videoWidth}x${videoElement.videoHeight}. Preview: ${FRAME_WIDTH}x${FRAME_HEIGHT} @ ${FPS}FPS.`);
@@ -305,41 +305,50 @@ openRecordModalButton.addEventListener('click', () => {
           })
           .catch(e => {
             console.error("Error attempting to play video:", e);
-            reject(e);
+            reject(e); // Reject if play fails
           });
       };
-      videoElement.onended = () => { // Optional: handle stream ending during setup
+      videoElement.onended = () => {
           stopLivePreview();
           console.log('Webcam stream ended during setup.');
-          // Potentially reject or show an error if it ends unexpectedly here
+          // Consider rejecting here if this is unexpected before preview starts
       };
-      videoElement.onerror = (e) => { // Catch video element errors
+      videoElement.onerror = (e) => {
           console.error('Video element error during setup:', e);
           reject(new Error('Video element error.'));
       };
-      // If srcObject is set but onloadedmetadata doesn't fire quickly (e.g., if already loaded)
-      // some browsers might need a nudge or direct check. However, typical flow is srcObject -> onloadedmetadata -> play.
-      // For robustness, if videoWidth is already available, we could try to proceed, but standard is to wait for onloadedmetadata.
-      if (videoElement.readyState >= videoElement.HAVE_METADATA) {
-        // This might be true if the stream was already processed or metadata loaded very fast.
-        // Calling play() here directly could be an option but might lead to race conditions.
-        // Sticking to the onloadedmetadata event is generally safer.
-        console.log("Video metadata seems to be already available or loaded quickly.");
+      // Fallback check if metadata is already loaded (less common for fresh stream)
+      if (videoElement.readyState >= videoElement.HAVE_METADATA && !videoElement.paused) {
+        console.log("Video metadata was already available and possibly playing; resolving play promise.");
+        resolve();
+      } else if (videoElement.readyState >= videoElement.HAVE_METADATA && videoElement.paused) {
+        console.log("Video metadata was already available but paused; attempting to play.");
+        videoElement.play()
+          .then(() => {
+            console.log("Video element play() successful (already had metadata).");
+            resolve();
+          })
+          .catch(e => {
+            console.error("Error attempting to play video (already had metadata):", e);
+            reject(e);
+          });
       }
     });
   })
   .then(() => {
-    // This .then() executes after videoElement.play() promise resolves
+    // This .then() executes after videoElement.play() promise (and its wrapper) resolves
     startLivePreview();
     modalStatusElement.textContent = 'Ready to record.';
-    modalRecordButton.disabled = false;
+    modalRecordButton.disabled = false; // Enable record button now that preview is ready
   })
   .catch(err => {
     console.error('Webcam access or initialization failed:', err);
-    modalStatusElement.textContent = 'Error: Webcam failed. ' + (err.message || err);
-    // Ensure UI is in a consistent state on failure
+    // Use a more user-friendly error message format as suggested
+    modalStatusElement.textContent = 'Error accessing camera: ' + (err.message || 'Unknown error');
     modalRecordButton.disabled = true;
-    stopLivePreview(); // Clean up if preview started somehow
+    stopLivePreview(); // Ensure cleanup
+    // Optionally, hide or offer to close the modal on error
+    // recordModal.style.display = 'none'; 
   });
 });
 
