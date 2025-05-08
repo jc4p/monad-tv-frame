@@ -1217,7 +1217,7 @@ modalSaveButton.addEventListener('click', async () => {
   if (!currentUserFid) {
     try {
         console.log('Save: currentUserFid not initially set, trying to get from Frame SDK context...');
-        const context = await frame.sdk.getContext();
+        const context = await frame.sdk.context;
         // Workaround for potential nested user object
         let user = context.user;
         if (user && user.user) { 
