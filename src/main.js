@@ -54,12 +54,12 @@ const modalPlayButton = document.getElementById('modalPlayButton');     // Play 
 const modalSaveButton = document.getElementById('modalSaveButton');     // Save button inside the modal
 const modalStatusElement = document.getElementById('modalStatus');        // Status message element inside the modal
 
-const FPS = 15;
+const FPS = 5;
 const FPS_GRID = 10;
 const FPS_NOISE = 30; 
-const RECORD_DURATION_MS = 4000;
-const FRAME_WIDTH = 240;
-const FRAME_HEIGHT = 240;
+const RECORD_DURATION_MS = 2000;
+const FRAME_WIDTH = 160;
+const FRAME_HEIGHT = 160;
 const TOTAL_PIXELS = FRAME_WIDTH * FRAME_HEIGHT;
 
 let livePreviewInterval = null;
@@ -417,6 +417,7 @@ modalPlayButton.addEventListener('click', () => {
 
   playbackInterval = setInterval(() => {
     if (currentFrameIndex >= recordedFrames.length) {
+      console.log("Playback: Looping back to frame 0.");
       currentFrameIndex = 0; // Loop
       reconstructedModalPlaybackFrame = null; // Reset for the new loop to ensure first frame is full
     }
@@ -449,43 +450,42 @@ function stopRecording() {
   }
 
   if (recordedFrames.length > 0) {
-    modalSaveButton.style.display = 'inline-block'; // Show save button
+    modalSaveButton.style.display = 'inline-block'; 
     modalSaveButton.disabled = false;
-
-    modalRecordButton.textContent = 'Re-record'; // Set text to Re-record
-    modalRecordButton.disabled = false;         // Ensure Re-record is enabled
-
-    modalPlayButton.style.display = 'none'; // Hide the play/stop button
-
-    modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview...`;
+    modalRecordButton.textContent = 'Re-record'; 
+    modalRecordButton.disabled = false;         
+    modalPlayButton.style.display = 'none'; 
+    
+    // Calculate total compressed size
+    const totalCompressedSizeBytes = recordedFrames.reduce((sum, frame) => sum + (frame.compressedData?.byteLength || 0), 0);
+    const totalCompressedSizeKB = (totalCompressedSizeBytes / 1024).toFixed(2);
+    
+    modalStatusElement.textContent = `Done! ${recordedFrames.length} frames. Playing preview... (${totalCompressedSizeKB} KB)`;
     
     stopLivePreview(); 
-    // Display the last frame statically first (optional, but good for a brief moment)
-    // const lastRecordedFrameData = recordedFrames[recordedFrames.length-1];
-    // const modalCtx = modalPreviewCanvas.getContext('2d');
-    // reconstructAndDrawFrame(modalCtx, lastRecordedFrameData, true);
 
-    // Automatically start playback by programmatically clicking the (now hidden) play button.
-    // Its existing event listener should handle looping.
     modalPlayButton.click(); 
 
   } else {
     modalStatusElement.textContent = 'Recording stopped early or failed.';
     modalRecordButton.textContent = 'Start Recording'; 
     modalRecordButton.disabled = false;
-    modalPlayButton.style.display = 'none'; // Keep it hidden
-    modalSaveButton.style.display = 'none'; // Keep save hidden
+    modalPlayButton.style.display = 'none'; 
+    modalSaveButton.style.display = 'none'; 
     if (recordModal.style.display === 'flex' && !livePreviewInterval) { 
         startLivePreview(); 
     }
   }
   
-  const totalCompressedSize = recordedFrames.reduce((sum, frame) => sum + frame.size, 0);
+  // Log summary including total size
+  const totalCompressedSizeBytes = recordedFrames.reduce((sum, frame) => sum + (frame.compressedData?.byteLength || 0), 0);
+  const totalCompressedSizeKB = (totalCompressedSizeBytes / 1024).toFixed(2);
   const recordingTimestamp = new Date().toISOString();
   console.log('--- Modal Recording Summary ---');
   if(currentUserFid) console.log(`FID (from Frame SDK): ${currentUserFid}`);
   console.log(`Timestamp: ${recordingTimestamp}`);
-  console.log(`Total Compressed Size: ${totalCompressedSize} bytes for ${recordedFrames.length} frames.`);
+  console.log(`Total Frames: ${recordedFrames.length}`);
+  console.log(`Total Compressed Size: ${totalCompressedSizeBytes} bytes (${totalCompressedSizeKB} KB)`); // Log size in bytes and KB
 }
 
 // Old playButton listener (commented out, to be adapted for modalPlayButton next)
@@ -909,77 +909,87 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 // Renamed and adapted for grid player objects
+// Updated renderGridVideoFrame to handle scaling
 function renderGridVideoFrame(player) {
     if (!player || !player.frames || player.frames.length === 0) return;
 
     const frameToPlay = player.frames[player.currentFrameIndex];
     let decompressedData;
-    let currentPixelData; // Uint8Array of grayscale pixels
+    let currentPixelData; // Uint8Array of 160x160 grayscale pixels
 
     try {
+        // --- Frame Reconstruction Logic (remains the same) ---
         if (frameToPlay.type === 'full') {
             decompressedData = pako.inflate(frameToPlay.compressedData);
             currentPixelData = new Uint8Array(decompressedData);
             player.reconstructedFrameData = currentPixelData;
         } else { // type === 'diff'
             if (!player.reconstructedFrameData) {
-                console.warn('Grid: Cannot reconstruct diff frame without a previous full frame for player', player.sender);
-                // Attempt to find the first full frame in this player's set if missing (e.g. mid-load)
+                 console.warn('Grid: Cannot reconstruct diff frame without a previous full frame for player', player.sender);
                 const firstFull = player.frames.find(f => f.type === 'full');
                 if(firstFull) {
                     player.reconstructedFrameData = new Uint8Array(pako.inflate(firstFull.compressedData));
                 } else {
-                    return; // Still can't proceed
+                    return; 
                 }
             }
             decompressedData = pako.inflate(frameToPlay.compressedData);
             const diffArray = deserializeDiff(new Uint8Array(decompressedData));
             currentPixelData = new Uint8Array(player.reconstructedFrameData); // Copy
             for (const diff of diffArray) {
-                if (diff.index < currentPixelData.length) { // Bounds check
+                if (diff.index < currentPixelData.length) { 
                     currentPixelData[diff.index] = diff.value;
                 }
             }
             player.reconstructedFrameData = currentPixelData;
         }
+        // --- End Frame Reconstruction Logic ---
 
-        // Create ImageData for the small grid canvas
-        const gridFrameWidth = player.canvas.width;
-        const gridFrameHeight = player.canvas.height;
-        const imageData = player.ctx.createImageData(gridFrameWidth, gridFrameHeight);
+        // --- Drawing & Scaling Logic ---
+        const gridCanvas = player.canvas;
+        const gridCtx = player.ctx;
+        const gridWidth = gridCanvas.width;
+        const gridHeight = gridCanvas.height;
+
+        // Create ImageData for the source resolution (160x160)
+        const sourceImageData = gridCtx.createImageData(FRAME_WIDTH, FRAME_HEIGHT);
+        for (let i = 0, j = 0; i < currentPixelData.length; i++, j += 4) {
+            sourceImageData.data[j]     = currentPixelData[i];
+            sourceImageData.data[j + 1] = currentPixelData[i];
+            sourceImageData.data[j + 2] = currentPixelData[i];
+            sourceImageData.data[j + 3] = 255;
+        }
         
-        // Assuming currentPixelData is for 240x240, and we need to draw it on a smaller grid canvas
-        // This requires scaling. For simplicity, let's assume grid canvas is also 240x240 for now
-        // or that currentPixelData itself is already scaled (which it won't be from contract).
-        // A proper implementation would scale pixel data here or use drawImage with a source canvas.
-        // For now, let's assume direct pixel mapping if grid canvas matches FRAME_WIDTH/HEIGHT
-        // This will look bad if grid cells are not 240x240. We should fix this later if needed.
-        const sourcePixelCount = currentPixelData.length; // Expected to be TOTAL_PIXELS (240*240)
-        const destPixelCount = gridFrameWidth * gridFrameHeight;
+        // Use a temporary canvas to draw the 160x160 image data
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = FRAME_WIDTH;
+        tempCanvas.height = FRAME_HEIGHT;
+        const tempCtx = tempCanvas.getContext('2d');
+        tempCtx.putImageData(sourceImageData, 0, 0);
 
-        for (let i = 0; i < destPixelCount; i++) {
-            // This basic scaling/sampling will likely look poor.
-            // A proper resize algorithm (e.g., bilinear) would be better for arbitrary sizes.
-            // For now, just sample, assuming aspect ratio is maintained.
-            const sourceIndex = Math.floor(i * (sourcePixelCount / destPixelCount));
-            const val = currentPixelData[sourceIndex] || 0; // Fallback to black if out of bounds
-            const destOffset = i * 4;
-            imageData.data[destOffset] = val;
-            imageData.data[destOffset + 1] = val;
-            imageData.data[destOffset + 2] = val;
-            imageData.data[destOffset + 3] = 255;
-        }
-        player.ctx.putImageData(imageData, 0, 0);
+        // Clear the grid canvas
+        gridCtx.clearRect(0, 0, gridWidth, gridHeight);
 
-        // Draw FID on bottom right
+        // Disable image smoothing for sharp pixelated look when scaling up
+        gridCtx.imageSmoothingEnabled = false; 
+
+        // Draw the temporary 160x160 canvas onto the grid canvas, scaling it
+        gridCtx.drawImage(tempCanvas, 0, 0, FRAME_WIDTH, FRAME_HEIGHT, 0, 0, gridWidth, gridHeight);
+        
+        // Draw FID on bottom right (after scaling)
         if (player.fid) {
-            player.ctx.font = 'bold 10px Arial'; // Smaller font for FID
-            player.ctx.fillStyle = 'rgba(255, 255, 255, 0.7)'; // Semi-transparent white
-            player.ctx.textAlign = 'right';
-            player.ctx.fillText(`FID: ${player.fid}`, gridFrameWidth - 5, gridFrameHeight - 5); // 5px padding
+            gridCtx.font = 'bold 10px Arial'; 
+            gridCtx.fillStyle = 'rgba(255, 255, 255, 0.7)'; 
+            gridCtx.textAlign = 'right';
+            gridCtx.fillText(`FID: ${player.fid}`, gridWidth - 5, gridHeight - 5); 
         }
+        // --- End Drawing & Scaling Logic ---
+
     } catch (e) {
         console.error(`GridRenderErr for ${player.sender}`, e);
+        // Optionally clear canvas on error
+        player.ctx.fillStyle = 'red';
+        player.ctx.fillText('ERR', gridWidth/2, gridHeight/2);
     }
 }
 
