@@ -20,7 +20,7 @@ const videoClipUpdatedEventAbi = parseAbiItem('event VideoClipUpdated(address in
 
 const BLOCK_RANGE_LIMIT = 1000; // Alchemy's limit
 const CACHE_KEY = "monad-grid:all_video_clip_logs_v1"; // Namespaced and versioned cache key
-const CACHE_TTL_SECONDS = 30 * 60; // 30 minutes
+const CACHE_TTL_SECONDS = 2 * 60; // 2 minutes
 
 // CORS settings applied to all responses
 const CORS_HEADERS = {
