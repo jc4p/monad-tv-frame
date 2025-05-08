@@ -1322,6 +1322,10 @@ modalSaveButton.addEventListener('click', async () => {
   }
   const estimatedTotalSizeForContract = firstFrameData.compressedData.byteLength + (diffFramesRaw.length > 0 ? hexToBytes(compressedDiffsBytesForContract).byteLength : 0);
   console.log(`Estimated Total Bytes for Contract (I-frame + Compressed P-frames blob): ${estimatedTotalSizeForContract} bytes (${(estimatedTotalSizeForContract/1024).toFixed(2)} KB)`);
+  
+  // Update modal status with estimated size before proceeding
+  modalStatusElement.textContent = `Processed data. Est. on-chain size: ${(estimatedTotalSizeForContract/1024).toFixed(2)} KB. Connecting...`;
+  
   // --- End: Frame data processing and compression --- 
 
   // Re-check/ensure currentUserFid is available
