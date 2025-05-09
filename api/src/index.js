@@ -19,9 +19,10 @@ const FRAME_RECORDER_CONTRACT_ADDRESS = '0x1B5481D98B0cD6b3422E15d6e16102C3780B0
 const videoClipUpdatedEventAbi = parseAbiItem('event VideoClipUpdated(address indexed user, uint256 fid, uint256 timestamp)');
 
 const BLOCK_RANGE_LIMIT = 1000; // Alchemy's limit
-const CACHE_KEY = "monad-grid:all_video_clip_logs_v2"; // Incremented version for new cache structure
-const CACHE_TTL_SECONDS = 2 * 60; // 2 minutes
-const INITIAL_LOOKBACK_BLOCKS = 10000; // Increased for a deeper initial fetch
+const RECENT_CACHE_KEY = "monad-grid:all_video_clip_logs_v2"; // Cache for recent/delta updates
+const HISTORICAL_CACHE_KEY = "monad-grid:historical_logs_v1"; // Cache populated by backfill script
+const CACHE_TTL_SECONDS = 2 * 60; // 2 minutes for the recent cache
+const INITIAL_LOOKBACK_BLOCKS = 10000; // For the first fetch if both caches are empty
 
 // CORS settings applied to all responses
 const CORS_HEADERS = {
@@ -58,33 +59,7 @@ export default {
 			});
 		}
 
-		// Check KV Cache first
-		if (env.LOG_CACHE) {
-			try {
-				console.log(`Checking KV cache for key: ${CACHE_KEY}`);
-				const cachedResult = await env.LOG_CACHE.get(CACHE_KEY, { type: "json" });
-				
-				if (cachedResult && cachedResult.logs && cachedResult.cachedUpToBlock) {
-					console.log(`Cache hit. Cached up to block ${cachedResult.cachedUpToBlock}. Cache timestamp: ${cachedResult.cacheTimestamp}`);
-					
-					// We will still fetch new logs beyond cachedUpToBlock and merge if needed
-					// This ensures we serve fresh data if available, while leveraging the cache for older data.
-					// The main TTL on put() handles full refresh. This logic is for delta updates within TTL.
-					
-					// Fall through to fetch new logs and merge, using cachedResult as base for `fromBlock`
-				} else {
-					console.log("Cache miss or invalid cache structure.");
-					// proceed to full fetch, cachedResult will be null
-				}
-			} catch (kvError) {
-				console.error("Error reading from KV cache:", kvError);
-				// Proceed to fetch from origin
-			}
-		} else {
-			console.warn("LOG_CACHE KV namespace not bound or available.");
-		}
-
-		console.log("Proceeding to fetch logs from RPC (full or delta)...");
+		console.log("Proceeding to fetch logs from RPC (potentially merging historical, recent cache, and new delta)...");
 
 		// Define the Monad Testnet chain object for Viem
 		// Note: For workers, you often define chains inline or import them if using a larger Viem setup.
@@ -108,128 +83,175 @@ export default {
 				transport: http(), // Viem will use the rpcUrl from the chain definition
 			});
 
-			console.log("Fetching latest block number...");
+			console.log("Fetching latest block number from RPC...");
 			const currentRpcLatestBlock = await publicClient.getBlockNumber();
 			console.log(`Current RPC latest block number: ${currentRpcLatestBlock}`);
 
-			let allLogs = [];
+			let baseLogs = [];
+			let effectiveCachedUpToBlock = 0n; // The latest block covered by any cache we load
 			let queryFromBlock;
-			let isDeltaUpdate = false;
+			let cacheStatus = 'MISS_FULL_FETCH'; // Default status
 
-			// Try to get cached data again, in case it was fetched by a concurrent request or to re-evaluate
-			// This ensures we use the most up-to-date cache info before deciding the fetch range.
-			const potentiallyUpdatedCachedResult = env.LOG_CACHE ? await env.LOG_CACHE.get(CACHE_KEY, { type: "json" }) : null;
-
-			if (potentiallyUpdatedCachedResult && potentiallyUpdatedCachedResult.logs && potentiallyUpdatedCachedResult.cachedUpToBlock) {
-				const cachedUpToBlockNum = BigInt(potentiallyUpdatedCachedResult.cachedUpToBlock);
-				if (currentRpcLatestBlock > cachedUpToBlockNum) {
-					queryFromBlock = cachedUpToBlockNum + 1n;
-					allLogs = potentiallyUpdatedCachedResult.logs; // Start with existing cached logs
-					isDeltaUpdate = true;
-					console.log(`Delta update: Fetching logs from ${queryFromBlock} to ${currentRpcLatestBlock}. Starting with ${allLogs.length} cached logs.`);
-				} else {
-					// Cache is up-to-date or ahead (e.g. RPC node slightly behind)
-					console.log("Cache is already up-to-date with current RPC latest block. Returning cached data.");
-					return new Response(JSON.stringify(potentiallyUpdatedCachedResult), {
-						headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'X-Cache-Status': 'HIT_UPTODATE' },
-					});
+			if (env.LOG_CACHE) {
+				// 1. Try to load historical logs (long-term, deep history)
+				try {
+					console.log(`Checking historical KV cache for key: ${HISTORICAL_CACHE_KEY}`);
+					const historicalData = await env.LOG_CACHE.get(HISTORICAL_CACHE_KEY, { type: "json" });
+					if (historicalData && historicalData.logs && historicalData.fetchedUpToBlock) {
+						console.log(`Historical cache hit. Contains ${historicalData.logs.length} logs up to block ${historicalData.fetchedUpToBlock}.`);
+						baseLogs = historicalData.logs;
+						effectiveCachedUpToBlock = BigInt(historicalData.fetchedUpToBlock);
+						cacheStatus = 'HIT_HISTORICAL';
+					} else {
+						console.log("Historical cache miss or invalid structure.");
+					}
+				} catch (kvError) {
+					console.error("Error reading from Historical KV cache:", kvError);
 				}
+
+				// 2. Try to load recent/delta cache and see if it's more up-to-date
+				try {
+					console.log(`Checking recent KV cache for key: ${RECENT_CACHE_KEY}`);
+					const recentCachedResult = await env.LOG_CACHE.get(RECENT_CACHE_KEY, { type: "json" });
+					if (recentCachedResult && recentCachedResult.logs && recentCachedResult.cachedUpToBlock) {
+						const recentCacheBlockNum = BigInt(recentCachedResult.cachedUpToBlock);
+						console.log(`Recent cache hit. Contains ${recentCachedResult.logs.length} logs up to block ${recentCacheBlockNum}.`);
+						if (recentCacheBlockNum >= effectiveCachedUpToBlock) { // Use recent cache if it's same or newer
+							console.log("Recent cache is fresher or same as historical. Using it as base.");
+							baseLogs = recentCachedResult.logs;
+							effectiveCachedUpToBlock = recentCacheBlockNum;
+							cacheStatus = 'HIT_RECENT'; 
+							// If recent cache is fully up to date with RPC, we might return early
+							if (effectiveCachedUpToBlock >= currentRpcLatestBlock) {
+								console.log("Recent cache is already up-to-date with current RPC latest block. Returning its data.");
+								return new Response(JSON.stringify(recentCachedResult), {
+									headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'X-Cache-Status': 'HIT_RECENT_UPTODATE' },
+								});
+							}
+						} else {
+							console.log("Recent cache is older than historical data; historical data will be prioritized as base.");
+						}
+					} else {
+						console.log("Recent cache miss or invalid structure.");
+					}
+				} catch (kvError) {
+					console.error("Error reading from Recent KV cache:", kvError);
+				}
+			}
+
+			// 3. Determine queryFromBlock based on loaded caches
+			if (effectiveCachedUpToBlock > 0n && currentRpcLatestBlock > effectiveCachedUpToBlock) {
+				queryFromBlock = effectiveCachedUpToBlock + 1n;
+				console.log(`Delta update determined: Fetching logs from ${queryFromBlock} to ${currentRpcLatestBlock}. Starting with ${baseLogs.length} base logs from cache (${cacheStatus}).`);
+			} else if (effectiveCachedUpToBlock > 0n && currentRpcLatestBlock <= effectiveCachedUpToBlock) {
+				console.log("All caches are up-to-date with or ahead of RPC latest block. No new logs to fetch from RPC.");
+				// Sort baseLogs (could be historical or recent) before returning if no new fetch needed
+                baseLogs.sort((a,b) => Number(b.args.timestamp) - Number(a.args.timestamp));
+				const payload = { logs: baseLogs, cachedUpToBlock: effectiveCachedUpToBlock.toString(), totalLogs: baseLogs.length, source: cacheStatus, cacheTimestamp: new Date().toISOString() };
+				return new Response(JSON.stringify(payload), {
+					headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'X-Cache-Status': cacheStatus + '_UPTODATE' },
+				});
 			} else {
-				// Initial fetch or cache was invalid
+				// Initial fetch (neither historical nor recent cache provided a base or they were empty)
 				queryFromBlock = BigInt(Math.max(0, Number(currentRpcLatestBlock) - (INITIAL_LOOKBACK_BLOCKS - 1)));
 				if (queryFromBlock < 0n) queryFromBlock = 0n;
-				console.log(`Initial fetch: Looking back ${INITIAL_LOOKBACK_BLOCKS} blocks. Querying from ${queryFromBlock} to ${currentRpcLatestBlock}.`);
+				console.log(`Initial fetch (no/old cache): Looking back ${INITIAL_LOOKBACK_BLOCKS} blocks. Querying from ${queryFromBlock} to ${currentRpcLatestBlock}.`);
+				baseLogs = []; // Ensure baseLogs is empty for a true initial fetch scenario
+				cacheStatus = 'MISS_INITIAL_FETCH';
 			}
 			
 			let newLogsFetched = [];
 			let currentChunkStartBlock = queryFromBlock;
+			let fetchPerformed = false;
 
-			console.log(`Log fetching loop: from ${currentChunkStartBlock} up to ${currentRpcLatestBlock}.`);
-
-			while (currentChunkStartBlock <= currentRpcLatestBlock) {
-				let chunkToBlock = currentChunkStartBlock + BigInt(BLOCK_RANGE_LIMIT - 1);
-				if (chunkToBlock > currentRpcLatestBlock) {
-					chunkToBlock = currentRpcLatestBlock;
-				}
-
-				console.log(`Fetching logs for chunk: ${currentChunkStartBlock} to ${chunkToBlock}`);
-				try {
-					const chunkLogs = await publicClient.getLogs({
-						address: FRAME_RECORDER_CONTRACT_ADDRESS,
-						event: videoClipUpdatedEventAbi,
-						fromBlock: currentChunkStartBlock,
-						toBlock: chunkToBlock,
-					});
-
-					if (chunkLogs && chunkLogs.length > 0) {
-						console.log(`Found ${chunkLogs.length} logs in chunk ${currentChunkStartBlock}-${chunkToBlock}.`);
-						const serializableLogs = chunkLogs.map(log => 
-							JSON.parse(JSON.stringify(log, (key, value) =>
-								typeof value === 'bigint' ? value.toString() : value
-							))
-						);
-						newLogsFetched = newLogsFetched.concat(serializableLogs);
+			// Only loop if there are blocks to query
+			if (currentChunkStartBlock <= currentRpcLatestBlock) {
+				console.log(`Log fetching loop from RPC: from ${currentChunkStartBlock} up to ${currentRpcLatestBlock}.`);
+				fetchPerformed = true;
+				while (currentChunkStartBlock <= currentRpcLatestBlock) {
+					let chunkToBlock = currentChunkStartBlock + BigInt(BLOCK_RANGE_LIMIT - 1);
+					if (chunkToBlock > currentRpcLatestBlock) {
+						chunkToBlock = currentRpcLatestBlock;
 					}
-				} catch (chunkError) {
-					console.error(`Error fetching logs for chunk ${currentChunkStartBlock}-${chunkToBlock}:`, chunkError.message);
+
+					console.log(`Fetching logs for chunk: ${currentChunkStartBlock} to ${chunkToBlock}`);
+					try {
+						const chunkLogs = await publicClient.getLogs({
+							address: FRAME_RECORDER_CONTRACT_ADDRESS,
+							event: videoClipUpdatedEventAbi,
+							fromBlock: currentChunkStartBlock,
+							toBlock: chunkToBlock,
+						});
+
+						if (chunkLogs && chunkLogs.length > 0) {
+							console.log(`Found ${chunkLogs.length} logs in chunk ${currentChunkStartBlock}-${chunkToBlock}.`);
+							const serializableLogs = chunkLogs.map(log => 
+								JSON.parse(JSON.stringify(log, (key, value) =>
+									typeof value === 'bigint' ? value.toString() : value
+								))
+							);
+							newLogsFetched = newLogsFetched.concat(serializableLogs);
+						}
+					} catch (chunkError) {
+						console.error(`Error fetching logs for chunk ${currentChunkStartBlock}-${chunkToBlock}:`, chunkError.message);
+					}
+					
+					if (chunkToBlock === currentRpcLatestBlock) {
+						console.log("Reached current RPC latest block in chunk processing.");
+						break; 
+					}
+					currentChunkStartBlock = chunkToBlock + 1n;
 				}
-				
-				if (chunkToBlock === currentRpcLatestBlock) {
-					console.log("Reached current RPC latest block in chunk processing.");
-					break; 
-				}
-				currentChunkStartBlock = chunkToBlock + 1n;
 			}
 
-			// Merge new logs with existing cached logs if it was a delta update
-			if (isDeltaUpdate && newLogsFetched.length > 0) {
-				console.log(`Merging ${newLogsFetched.length} new logs with ${allLogs.length} cached logs.`);
-				// A simple concat and re-sort is robust for ensuring order and handling potential (though unlikely) overlaps
-				// if log sources were different or block numbers had minor discrepancies.
-				// For now, newLogsFetched are inherently newer, so simple concat might be okay if sorted later.
-				// However, to ensure correctness and handle potential re-orgs or overlaps if any source provides slightly older "new" logs:
-				const combinedForSort = allLogs.concat(newLogsFetched);
-                const logSignatures = new Set();
-                const uniqueCombined = [];
-                // Deduplicate based on transactionHash and logIndex, prioritizing newer if timestamps differ for same sig (unlikely for pure new fetch)
-                // For simplicity, let's sort first, then deduplicate by signature, keeping the first seen (which will be newest due to sort)
-                combinedForSort.sort((a,b) => Number(b.args.timestamp) - Number(a.args.timestamp));
-                for (const log of combinedForSort) {
-                    const sig = `${log.transactionHash}-${log.logIndex}`;
-                    if (!logSignatures.has(sig)) {
-                        uniqueCombined.push(log);
-                        logSignatures.add(sig);
-                    }
+			// Merge new logs with baseLogs
+			let finalLogs = baseLogs;
+			if (fetchPerformed && newLogsFetched.length > 0) {
+				console.log(`Merging ${newLogsFetched.length} new logs with ${baseLogs.length} base logs.`);
+				finalLogs = baseLogs.concat(newLogsFetched);
+				console.log(`Total logs before final sort & dedupe: ${finalLogs.length}`);
+			} else if (!fetchPerformed) {
+                console.log("No RPC fetch was performed (data likely up-to-date from cache).");
+            }
+
+            // Final sort and deduplication of all logs (historical + recent cache + new from RPC)
+            const logSignatures = new Set();
+            const uniqueCombinedLogs = [];
+            // Sort first by timestamp (descending) then block (descending) then logIndex (descending) for stable sort
+            finalLogs.sort((a,b) => {
+                const tsCompare = Number(b.args.timestamp) - Number(a.args.timestamp);
+                if (tsCompare !== 0) return tsCompare;
+                const blockCompare = BigInt(b.blockNumber) - BigInt(a.blockNumber);
+                if (blockCompare !== 0n) return blockCompare > 0n ? 1 : -1; // BigInt comparison needs care
+                return Number(b.logIndex) - Number(a.logIndex);
+            });
+
+            for (const log of finalLogs) {
+                const sig = `${log.transactionHash}-${log.logIndex}`;
+                if (!logSignatures.has(sig)) {
+                    uniqueCombinedLogs.push(log);
+                    logSignatures.add(sig);
                 }
-				allLogs = uniqueCombined;
-				console.log(`Total logs after delta merge and deduplication: ${allLogs.length}`);
-			} else if (!isDeltaUpdate) {
-				allLogs = newLogsFetched; // This was an initial fetch
-                // Sort initial fetch as well
-                allLogs.sort((a,b) => Number(b.args.timestamp) - Number(a.args.timestamp));
-			}
-            // If isDeltaUpdate but newLogsFetched.length is 0, allLogs remains the original cached logs.
-
-			// console.log(`Total logs prepared for response: ${allLogs.length}`); // Already logged after merge/set
+            }
+			console.log(`Total unique logs after final sort & deduplication: ${uniqueCombinedLogs.length}`);
 
 			const responsePayload = {
-				logs: allLogs, // these are now sorted newest first
-				cachedUpToBlock: currentRpcLatestBlock.toString(), // Cache up to the block we queried
-				totalLogs: allLogs.length,
-				source: isDeltaUpdate ? 'rpc_delta_update' : 'rpc_initial_fetch',
+				logs: uniqueCombinedLogs, 
+				cachedUpToBlock: currentRpcLatestBlock.toString(), 
+				totalLogs: uniqueCombinedLogs.length,
+				source: fetchPerformed ? (effectiveCachedUpToBlock > 0n ? 'rpc_delta_update' : 'rpc_initial_fetch') : cacheStatus,
 				cacheTimestamp: new Date().toISOString()
 			};
 
-			// Store/Update in KV Cache if available
+			// Store/Update the "recent" cache (CACHE_KEY) with the fully merged and up-to-date data
 			if (env.LOG_CACHE) {
 				try {
-					console.log(`Storing fetched logs in KV cache with TTL ${CACHE_TTL_SECONDS}s. Key: ${CACHE_KEY}`);
-					// Use waitUntil to not block the response to the client
-					ctx.waitUntil(env.LOG_CACHE.put(CACHE_KEY, JSON.stringify(responsePayload), {
+					console.log(`Storing/Updating recent logs in KV cache with TTL ${CACHE_TTL_SECONDS}s. Key: ${RECENT_CACHE_KEY}`);
+					ctx.waitUntil(env.LOG_CACHE.put(RECENT_CACHE_KEY, JSON.stringify(responsePayload), {
 						expirationTtl: CACHE_TTL_SECONDS,
 					}));
 				} catch (kvWriteError) {
-					console.error("Error writing to KV cache:", kvWriteError);
+					console.error("Error writing to recent KV cache:", kvWriteError);
 				}
 			}
 
@@ -237,7 +259,7 @@ export default {
 				headers: {
 					...CORS_HEADERS,
 					'Content-Type': 'application/json',
-					'X-Cache-Status': 'MISS'
+					'X-Cache-Status': fetchPerformed ? (effectiveCachedUpToBlock > 0n ? 'MISS_DELTA' : 'MISS_INITIAL') : cacheStatus.replace('HIT', 'HIT_SERVED')
 				}
 			});
 
